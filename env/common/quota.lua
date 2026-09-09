@@ -24,7 +24,9 @@ if redis.call("EXISTS", cfg_key) == 0 then
   return {"unknown", 0, 0, window_seconds, refill_ms, capacity, window_quota}
 end
 if redis.call("HGET", cfg_key, "revoked") == "1" then
-  return {"revoked", 0, 0, window_seconds, 0, capacity, window_quota}
+  -- 停用后仍要能查余量：返回真实的配置参数（尤其 refill_ms 不能给 0，
+  -- 否则控制面换算每秒补充速率时会除零），余量按 0 展示。
+  return {"revoked", 0, 0, window_seconds, refill_ms, capacity, window_quota}
 end
 
 local t      = redis.call("TIME")

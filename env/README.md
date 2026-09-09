@@ -14,7 +14,9 @@
 | 限制长周期总量 | 相邻两个固定桶加权的**滑动窗口**，避免固定窗口边界 2x 突发 |
 | 同密钥并发相对公平 | ① 数据面 per-key FIFO 锁，同密钥按到达顺序向 Redis 申请；② 判定+扣减在 Redis 单线程的一段 Lua 内原子完成，每次请求只扣自己的 1 个额度，不存在“先到的一批把额度抢光” |
 | 超限告诉调用方等多久 | 429 响应体 `error.retry_after_ms` / `error.retry_after`，并带标准 `Retry-After` 头；窗口超限等到桶边界，突发超限按令牌补充速率精确计算 |
-| 重启后已扣额度不丢、不增 | 判定与扣减是同一次原子落盘；Redis 开 AOF（`everysec`，可改 `always`）+ `noeviction`；两端自身无状态，随便重启 |
+| 重启后已扣额度不丢、不增 | 判定与扣减是同一次原子落盘；Redis 开 **AOF `appendfsync always`**（每笔扣减 fsync）、关闭 RDB 回退、`noeviction`；两端自身无状态，随便重启 |
+| Redis 重启后无需重启两端 | 两端对 `NOSCRIPT`（按异常类型识别并重新 `SCRIPT LOAD` 刷新 SHA）、连接拒绝、`LOADING/READONLY` 做自动重载+退避重试；Redis 恢复后下一次请求即自愈。宕机窗口返回明确 **503 + Retry-After**，不是裸 500；数据面连不上 Redis 启动时进入降级态而不是退出 |
+| 停用后仍可查余量 | 停用密钥的余量查询返回 200、`state=revoked` 与其真实配置；Lua 不再返回会导致除零的占位值 |
 | 两边对不上时以已对外发生的扣减为准 | **数据面只写计数，控制面只写配置**。控制面查余量时实时读计数；控制面从不回写/重置计数，历史扣减永远是事实来源 |
 | Docker 部署 | `docker compose up -d --build`，含 Redis（持久化卷）、控制面、数据面、模拟上游 |
 
@@ -108,7 +110,11 @@ X-Retry-After-Ms: 400
 
 `code` 取值：`burst_limited`（等令牌补充）、`window_limited`（等旧请求滑出
 长窗口）、`key_revoked`（403）、`invalid_api_key`（401）、
-`missing_api_key`（401）。
+`missing_api_key`（401）、`quota_store_unavailable`（503，记额度层
+重启/不可用，带 `Retry-After: 2`，Redis 恢复后自动自愈、无需重启两端）。
+
+> 停用后的密钥仍可查余量：`GET /v1/keys/{kid}/quota` 返回 200 且
+> `state="revoked"`，余量显示为 0、配置口径照常返回。
 
 ## 幂等重试（重要）
 
@@ -140,27 +146,35 @@ X-Retry-After-Ms: 400
    Redis 语义时可用 Cluster——同一密钥的 key 都带 `{qk:<kid>}` hash tag，
    Lua 访问的 cfg/tb/win/dedup 一定同 slot，而不同密钥自然分散到不同 slot
    实现水平分片）。
-2. **AOF 策略**：默认 `appendfsync everysec`（崩溃窗口 ≤1s）；金融级
-   口径用 `appendfsync always`。
-3. **管理员鉴权**：`ADMIN_TOKEN` 换成正式 IAM/JWT；管理口走内网或 mTLS。
-4. **密钥元数据**：当前密钥列表用 `SCAN cfg:*`。密钥量级很大或需要
+2. **AOF 策略**：默认 `appendfsync always`（每笔扣减 fsync，崩溃不丢已
+   对外的扣减，代价是每次约 0.1~1ms 磁盘同步）；吞吐优先可改 `everysec`，
+   崩溃窗口 ≤1s 且只可能丢“尚未返回给调用方”的扣减。已关闭 RDB 快照，
+   避免旧 dump 与 AOF 混用造成计数回退。
+3. **脚本缓存与重连**：两端启动时 `SCRIPT LOAD`，运行期 Redis 重启导致
+   `NOSCRIPT` 时由 `common/script_runner.py` 自动重载并刷新 SHA；连接
+   拒绝/`LOADING`/`READONLY` 指数退避重试。因此升级或重启 Redis 后无需
+   重启任何一面。
+4. **管理员鉴权**：`ADMIN_TOKEN` 换成正式 IAM/JWT；管理口走内网或 mTLS。
+5. **密钥元数据**：当前密钥列表用 `SCAN cfg:*`。密钥量级很大或需要
    审计/多版本配置时，控制面加 PostgreSQL 作为元数据 SoR，但**计数事实
    仍以 Redis 为准**（对账时以 `win/tb` 计数覆盖元数据中的派生值）。
-5. **数据面扩缩**：无状态，直接加多副本；上游地址用 `UPSTREAM_URL`
+6. **数据面扩缩**：无状态，直接加多副本；上游地址用 `UPSTREAM_URL`
    配置，代理默认透传 query/path/header（剔除 hop-by-hop 与密钥头）。
-6. **可观测**：建议数据面对 `burst_limited/window_limited/revoked`
-   打点上报 Prometheus（本仓库为聚焦核心未包含）。
+7. **可观测**：建议数据面对 `burst_limited/window_limited/revoked/
+   quota_store_unavailable` 打点上报 Prometheus（本仓库为聚焦核心未包含）。
 
 ## 目录
 
 ```
-common/             两端共享的协议：Lua 脚本 + key 规则（构建时各自打进镜像）
-  consume.lua       数据面：原子 去重→校验→令牌桶→滑动窗口→判定→落盘
-  quota.lua         控制面：只读余量查询，口径与 consume 一致
-  keys.py           key 前缀、hash、配置字段
-control_plane/      FastAPI：签发/停用/列表/查余量
-data_plane/         aiohttp 反向代理：per-key FIFO + EVAL 扣减 + 透传上游
-mock_upstream/      被保护的真实服务示例（标准库）
-redis/redis.conf    AOF + noeviction
-demo/e2e_demo.py    端到端自检
+common/               两端共享的协议（构建时各自打进镜像）
+  consume.lua         数据面：原子 去重→校验→令牌桶→滑动窗口→判定→落盘
+  quota.lua           控制面：只读余量查询，口径与 consume 一致
+  keys.py             key 规则、hash、配置字段
+  script_runner.py    NOSCRIPT 自动重载 + 连接/LOADING/READONLY 退避重试
+control_plane/        FastAPI：签发/停用/列表/查余量
+data_plane/          aiohttp 反向代理：per-key 轮转公平 + EVAL 扣减 + 透传上游
+  fairness.py         同一密钥内按调用方轮转的 FIFO 调度器
+mock_upstream/        被保护的真实服务示例（标准库）
+redis/redis.conf      AOF(always) + 关闭 RDB + noeviction
+demo/e2e_demo.py      端到端自检
 ```

@@ -19,6 +19,7 @@ import redis.asyncio as aioredis
 from aiohttp import web
 
 from common import keys
+from common.script_runner import run_script_async
 from data_plane.fairness import FairRegistry
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -52,29 +53,31 @@ class KeyLockRegistry:
 
 registry = KeyLockRegistry(MAX_KEY_LOCKS)
 redis_client: aioredis.Redis = None  # type: ignore
-consume_sha: str = ""
+_CONSUME_SRC = (COMMON_DIR / "consume.lua").read_text(encoding="utf-8")
+# SHA 放在可变 dict 里：Redis 重启清空脚本缓存后由 script_runner 重载刷新，
+# 无需重启数据面进程
+_consume_sha: dict = {"sha": None}
 
 
 async def init_redis(app: web.Application) -> None:
-    global redis_client, consume_sha
+    global redis_client
     redis_client = aioredis.Redis.from_url(REDIS_URL, decode_responses=True)
-    # 容忍 Redis 容器尚未就绪（compose healthcheck 的双保险）
+    app["upstream"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    # 短暂等待 Redis 就绪（正常容器编排下很快）；等不到也不退出，
+    # 进入降级态：healthz 报 503、调用返回 503，待 Redis 恢复后自愈。
     for attempt in range(30):
         try:
-            await redis_client.ping()
-            break
+            if await redis_client.ping():
+                break
         except (aioredis.ConnectionError, OSError):
-            await asyncio.sleep(1)
-    else:
-        raise RuntimeError("redis is not ready")
-    script = (COMMON_DIR / "consume.lua").read_text(encoding="utf-8")
-    consume_sha = await redis_client.script_load(script)
-    app["upstream"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+            pass
+        await asyncio.sleep(1)
 
 
 async def close_redis(app: web.Application) -> None:
     await app["upstream"].close()
-    await redis_client.aclose()
+    if redis_client is not None:
+        await redis_client.aclose()
 
 
 def _error(status: int, code: str, retry_after_ms: int | None = None,
@@ -101,8 +104,16 @@ def _error(status: int, code: str, retry_after_ms: int | None = None,
     return web.json_response(body, status=status, headers=headers)
 
 
+class StoreUnavailableError(Exception):
+    """记额度那层不可用（连接不上 / 重启中 / 只读故障切换）。"""
+
+
 async def consume(kid: str, idem: str) -> list:
-    cfg = await redis_client.hgetall(keys.cfg_key(kid))
+    try:
+        cfg = await redis_client.hgetall(keys.cfg_key(kid))
+    except (aioredis.ConnectionError, aioredis.TimeoutError,
+            aioredis.BusyLoadingError) as exc:
+        raise StoreUnavailableError() from exc
     if not cfg:
         return [3, "key not found"]
 
@@ -117,17 +128,16 @@ async def consume(kid: str, idem: str) -> list:
         keys.DEFAULT_IDEM_TTL_SECONDS,
     ]
     num_keys = 3 if idem else 2
-    dedup = keys.dedup_key(kid, idem) if idem else None
     lua_keys = [keys.cfg_key(kid), keys.tb_key(kid)]
     if idem:
-        lua_keys.append(dedup)
+        lua_keys.append(keys.dedup_key(kid, idem))
     try:
-        return await redis_client.evalsha(consume_sha, num_keys, *lua_keys, *args)
-    except aioredis.ResponseError as exc:
-        if "NOSCRIPT" not in str(exc):
-            raise
-        script = (COMMON_DIR / "consume.lua").read_text(encoding="utf-8")
-        return await redis_client.eval(script, num_keys, *lua_keys, *args)
+        return await run_script_async(
+            redis_client, _CONSUME_SRC, _consume_sha, num_keys,
+            [*lua_keys, *args])
+    except (aioredis.ConnectionError, aioredis.TimeoutError,
+            aioredis.BusyLoadingError) as exc:
+        raise StoreUnavailableError() from exc
 
 
 async def handle_proxy(request: web.Request) -> web.Response:
@@ -147,7 +157,12 @@ async def handle_proxy(request: web.Request) -> web.Response:
     if queue is not None:
         await queue.acquire(client)
     try:
-        result = await consume(kid, idem)
+        try:
+            result = await consume(kid, idem)
+        except StoreUnavailableError:
+            # 记额度层重启/不可用：明确告知稍后重试，绝不“放行”也不裸 500
+            return _error(503, "quota_store_unavailable", retry_after_ms=2000,
+                          detail="quota store is restarting or unreachable; retry shortly")
     finally:
         if queue is not None:
             queue.release(client)
@@ -213,8 +228,12 @@ async def forward_to_upstream(request: web.Request,
 
 
 async def healthz(request: web.Request) -> web.Response:
-    await redis_client.ping()
-    return web.json_response({"ok": True, "plane": "data"})
+    try:
+        await redis_client.ping()
+    except (aioredis.ConnectionError, aioredis.TimeoutError, AttributeError):
+        return web.json_response(
+            {"ok": False, "plane": "data", "store": "unavailable"}, status=503)
+    return web.json_response({"ok": True, "plane": "data", "store": "ok"})
 
 
 app = web.Application()

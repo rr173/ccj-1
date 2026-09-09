@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -19,9 +20,9 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-CP = "http://localhost:8000"
-DP = "http://localhost:8080"
-ADMIN = "change-me-admin-token"
+CP = os.environ.get("CP", "http://localhost:8000")
+DP = os.environ.get("DP", "http://localhost:8080")
+ADMIN = os.environ.get("ADMIN_TOKEN", "change-me-admin-token")
 
 PASS, FAIL = "PASS", "FAIL"
 results: list[tuple[str, str, str]] = []
@@ -203,16 +204,24 @@ def t_auth_and_revoke() -> None:
            s_before == 200 and s_after == 403 and body["error"]["code"] == "key_revoked",
            f"{s_before}->{s_after}")
     record("停用密钥在控制面视图中为 revoked", quota(kid)["state"] == "revoked")
+    # 回归：停用后查余量必须仍然 200（曾经因 refill_ms=0 除零报 500）
+    status, _, qbody = http("GET", f"{CP}/v1/keys/{kid}/quota",
+                            {"Authorization": f"Bearer {ADMIN}"})
+    record("停用后仍可查余量且返回 200、state=revoked",
+           status == 200 and qbody.get("state") == "revoked"
+           and qbody["burst"]["refill_per_second"] is not None,
+           f"status={status}")
 
 
 def t_restart_durability(compose_file: str) -> None:
-    print("\n=== 7) Redis 重启：已扣额度不丢、不增 ===")
+    print("\n=== 7) 记额度层重启：两端不重启，已扣额度不丢不增、自动恢复 ===")
     kid, key = issue_key("durability", burst=100, refill_ms=100000, win_s=300, win_q=10)
-    for _ in range(5):
+    for _ in range(4):
         s, _, _ = call_dp(key)
         assert s == 200
     before = quota(kid)
-    time.sleep(1.5)  # 等 AOF everysec 落盘
+    assert before["burst"]["remaining"] == 96 and before["window"]["remaining"] == 6, before
+    time.sleep(1.5)  # 等 AOF 落盘
     print("  -- 重启 redis 容器 ...")
     r = subprocess.run(["docker", "compose", "-f", compose_file, "restart", "redis"],
                        capture_output=True, text=True)
@@ -220,14 +229,20 @@ def t_restart_durability(compose_file: str) -> None:
         record("重启 redis（跳过：未找到 docker compose）", False, r.stderr.strip()[:200])
         return
     wait_healthy()
-    time.sleep(1)
+    # 恢复后：余量必须与重启前逐字节一致，且无需重启控制面/数据面
     after = quota(kid)
-    record("重启后窗口余量保持 5（扣减未丢、未凭空增加）",
-           after["window"]["remaining"] == before["window"]["remaining"] == 5
-           and after["burst"]["remaining"] == before["burst"]["remaining"],
-           f"before={before['window']['remaining']} after={after['window']['remaining']}")
+    record("重启后余量与重启前完全一致（不丢、不增）",
+           after["burst"]["remaining"] == 96 and after["window"]["remaining"] == 6,
+           f"before=(96,6) after=({after['burst']['remaining']},{after['window']['remaining']})")
+    s, _, _ = call_dp(key)
+    record("数据面无需重启，恢复后调用自动成功", s == 200, f"status={s}")
+    again = quota(kid)
+    record("恢复后的调用只扣 1 个额度（95/5）",
+           again["burst"]["remaining"] == 95 and again["window"]["remaining"] == 5,
+           f"now=({again['burst']['remaining']},{again['window']['remaining']})")
+    # 再用掉剩余 5 个，第 6 个必须被拒，证明总量没有凭空恢复
     statuses = [call_dp(key)[0] for _ in range(6)]
-    record("重启后仍只能再用 5 个，第 6 个被拒",
+    record("剩余额度精确用完后第 6 个被 429 拒绝",
            statuses[:5] == [200] * 5 and statuses[5] == 429,
            f"statuses={statuses}")
 
