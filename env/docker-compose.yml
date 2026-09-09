@@ -1,0 +1,71 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    configs:
+      - source: redis_conf
+        target: /usr/local/etc/redis/redis.conf
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: control_plane/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-change-me-admin-token}
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  data-plane:
+    build:
+      context: .
+      dockerfile: data_plane/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      UPSTREAM_URL: http://upstream:8000
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      upstream:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  upstream:
+    build:
+      context: .
+      dockerfile: mock_upstream/Dockerfile
+    # 不映射宿主机端口：外部调用方只能经过数据面访问
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+configs:
+  redis_conf:
+    file: ./redis/redis.conf
+
+volumes:
+  redis-data:
