@@ -9,7 +9,8 @@
 |---|---|
 | 控制面/数据面分开部署 | `control_plane/`（签发/停用/查余量，端口 8000）与 `data_plane/`（每次调用扣额度，端口 8080），独立 Dockerfile、独立进程，分别水平扩缩 |
 | 签发、停用密钥 | `POST /v1/keys`、`POST /v1/keys/{kid}/revoke`。明文密钥只在签发时返回一次，存储只存 SHA-256 哈希 |
-| 查看当前窗口剩余额度 | `GET /v1/keys/{kid}/quota`，只读 Lua，口径与数据面完全一致 |
+| 查看当前窗口剩余额度 | `GET /v1/keys/{kid}/quota`，只读 Lua，口径与数据面完全一致；一次返回总盘、公共池与各点名调用方份额的余量 |
+| 给指定调用方预留额度 | `PUT/DELETE /v1/keys/{kid}/shares/{caller}`：每人一截突发+窗口，从密钥总量里切出；未点名调用方用剩下的公共池，两边互不相通 |
 | 限制短时间突发 | 令牌桶（容量=突发上限，按毫秒匀速补令牌） |
 | 限制长周期总量 | 相邻两个固定桶加权的**滑动窗口**，避免固定窗口边界 2x 突发 |
 | 同密钥并发相对公平 | ① 数据面 per-key FIFO 锁，同密钥按到达顺序向 Redis 申请；② 判定+扣减在 Redis 单线程的一段 Lua 内原子完成，每次请求只扣自己的 1 个额度，不存在“先到的一批把额度抢光” |
@@ -26,18 +27,19 @@
                 管理员
                   │ Bearer ADMIN_TOKEN
                   ▼
-          ┌────────────────┐   写配置 hash（签发/停用）
+          ┌────────────────┐   写配置 hash / 份额表（签发/停用/设份额）
           │  control-plane │────────────────┐
           │  (FastAPI)     │◀─只读查余量────┤
           └────────────────┘                │
                                             ▼
    调用方 X-Api-Key              ┌─────────────────────┐
    ────────────────────────────▶│   Redis 7（AOF）     │
-                                │  {qk:id}cfg   配置    │
-                                │  {qk:id}tb    令牌桶  │
-                                │  {qk:id}win:* 窗口计数│
-   ┌────────────────┐           │  {qk:id}dedup:* 幂等 │
-   │  data-plane    │ EVAL Lua  └─────────────────────┘
+                                │  {qk:id}cfg    配置   │
+                                │  {qk:id}shares 份额表 │
+                                │  {qk:id}tb     令牌桶 │
+                                │  {qk:id}win:*  窗口计数│
+   ┌────────────────┐           │  {qk:id}stb/swin:* 份额计数│
+   │  data-plane    │ EVAL Lua  │  {qk:id}dedup:* 幂等  │
    │ (aiohttp 代理) │───────────────▲ 原子判定+扣减
    │ 每密钥轮转公平  │               │
    └───────┬────────┘               │
@@ -48,9 +50,12 @@
 
 关键边界：
 
-- **控制面**写 `{qk:<kid>}cfg`；**数据面**对 cfg 只读，只写
-  `{qk:<kid>}tb` / `{qk:<kid>}win:*` / `{qk:<kid>}dedup:*`。生产环境建议用
-  两套 Redis ACL 用户分别授权（ACL 对 Lua 内访问的 key 同样生效）。
+- **控制面**写 `{qk:<kid>}cfg` 与 `{qk:<kid>}shares`（份额表，经
+  set_share.lua 原子校验“Σ份额 ≤ 密钥总量”后写入，并把预留合计回写到
+  cfg 的 `reserved_burst/reserved_window`）；**数据面**对配置只读，只写
+  `{qk:<kid>}tb` / `{qk:<kid>}win:*` / `{qk:<kid>}stb:*` /
+  `{qk:<kid>}swin:*` / `{qk:<kid>}dedup:*`。生产环境建议用两套 Redis ACL
+  用户分别授权（ACL 对 Lua 内访问的 key 同样生效）。
 - 数据面**不缓存“是否放行/剩余多少”的结论**，每请求实时执行 Lua；
   因此停用在下一次调用立即生效。
 - 判定时间一律取 Redis `TIME`，不相信调用方或本机时钟。
@@ -72,9 +77,18 @@ curl -s -X POST localhost:8000/v1/keys \
 # 调用开放接口（数据面 -> 上游）
 curl -i localhost:8080/v1/hello -H 'X-Api-Key: qk_xxx'
 
-# 查余量
+# 查余量（总盘 + 公共池 + 各份额）
 curl -s localhost:8000/v1/keys/<kid>/quota \
   -H "Authorization: Bearer change-me-admin-token"
+
+# 给调用方 alice 预留一截：突发 2、窗口 20（从密钥总量里切出）
+curl -s -X PUT localhost:8000/v1/keys/<kid>/shares/alice \
+  -H "Authorization: Bearer change-me-admin-token" \
+  -H 'Content-Type: application/json' \
+  -d '{"burst_capacity":2,"window_quota":20}'
+# 之后 alice（X-Client-Id: alice）只用自己的 2/20；其他调用方只能用
+# 公共池（突发 3、窗口 80）。Σ份额超总量会被 409 拒绝；取消预留：
+#   curl -X DELETE localhost:8000/v1/keys/<kid>/shares/alice ...
 
 # 停用
 curl -s -X POST localhost:8000/v1/keys/<kid>/revoke \
@@ -167,14 +181,32 @@ X-Retry-After-Ms: 400
 
 ```
 common/               两端共享的协议（构建时各自打进镜像）
-  consume.lua         数据面：原子 去重→校验→令牌桶→滑动窗口→判定→落盘
-  quota.lua           控制面：只读余量查询，口径与 consume 一致
+  consume.lua         数据面：原子 去重→校验→选池(份额/公共)→令牌桶→滑动窗口→判定→落盘
+  quota.lua           控制面：只读余量查询（总盘+公共池+各份额），口径与 consume 一致
+  set_share.lua       控制面：原子校验“Σ份额 ≤ 总量”并写入份额表
   keys.py             key 规则、hash、配置字段
   script_runner.py    NOSCRIPT 自动重载 + 连接/LOADING/READONLY 退避重试
-control_plane/        FastAPI：签发/停用/列表/查余量
+control_plane/        FastAPI：签发/停用/列表/查余量/设份额
 data_plane/          aiohttp 反向代理：per-key 轮转公平 + EVAL 扣减 + 透传上游
   fairness.py         同一密钥内按调用方轮转的 FIFO 调度器
 mock_upstream/        被保护的真实服务示例（标准库）
 redis/redis.conf      AOF(always) + 关闭 RDB + noeviction
 demo/e2e_demo.py      端到端自检
 ```
+
+## 按调用方预留份额（同一把密钥内的额度隔离）
+
+- 份额从密钥总量里切出：每人一份 `burst_capacity` + `window_quota`，补充速率与
+  窗口长度沿用密钥配置。`set_share.lua` 在 Redis 内原子校验
+  **Σ份额 ≤ 密钥总量**（突发、窗口两个维度分别约束），多控制面并发也不会超分；
+  剩余部分即公共池，留给未点名调用方。
+- 判定在 `consume.lua` 内原子完成：请求带 `X-Client-Id` 命中份额表 → 只扣自己
+  的预留池（独立令牌桶 `{qk:<kid>}stb:<sha1(caller)>` 与窗口计数
+  `{qk:<kid>}swin:*`），**自己的用完了公共池还有也不能拿**，429 照常给出
+  `retry_after_ms`；未命中 → 只扣公共池（`总量 − Σ预留`），**吃不到别人留的**。
+- 查余量：`GET /v1/keys/{kid}/quota` 一次返回总盘（顶层 `burst/window`）、
+  公共池（`shared_pool`）与每人的配额和余量（`shares[]`）。
+- 密钥停用后所有份额与公共池**立即**一并失效（revoked 检查在任何份额逻辑
+  之前）；停用密钥不能再设份额（409）；份额配置保留，余量查询照常返回口径。
+- 取消份额（`DELETE`）后预留立即回到公共池；该调用方已发生的扣减计数原样
+  保留（有 TTL 自然过期），不回写、不补偿。

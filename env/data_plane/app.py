@@ -6,6 +6,11 @@
   最终“放不放行、还剩多少”集中在 Redis 单线程 Lua 中原子判定，因此多副本
   部署也绝不超发；跨副本的严格轮转需要按密钥一致性路由（见 README）。
 
+份额隔离（consume.lua 内原子判定）：
+  控制面可为密钥指定若干调用方各留一份突发/窗口额度（shares 表）。
+  被点名的调用方只用自己的份额，未点名的只用公共池（总量 − 全部预留），
+  两边互不相通；密钥停用后份额与公共池一并立即失效。
+
 数据面不持有任何额度状态：进程重启不丢、不增任何额度。
 """
 from __future__ import annotations
@@ -108,7 +113,7 @@ class StoreUnavailableError(Exception):
     """记额度那层不可用（连接不上 / 重启中 / 只读故障切换）。"""
 
 
-async def consume(kid: str, idem: str) -> list:
+async def consume(kid: str, idem: str, client: str) -> list:
     try:
         cfg = await redis_client.hgetall(keys.cfg_key(kid))
     except (aioredis.ConnectionError, aioredis.TimeoutError,
@@ -126,9 +131,10 @@ async def consume(kid: str, idem: str) -> list:
         1,
         idem,
         keys.DEFAULT_IDEM_TTL_SECONDS,
+        client,
     ]
-    num_keys = 3 if idem else 2
-    lua_keys = [keys.cfg_key(kid), keys.tb_key(kid)]
+    num_keys = 4 if idem else 3
+    lua_keys = [keys.cfg_key(kid), keys.tb_key(kid), keys.shares_key(kid)]
     if idem:
         lua_keys.append(keys.dedup_key(kid, idem))
     try:
@@ -153,12 +159,13 @@ async def handle_proxy(request: web.Request) -> web.Response:
 
     # 同密钥、按调用方轮转：先到先判，但每个请求只扣自己的 1 个额度，
     # 任何调用方都不能成批抢光；最终额度由 Redis Lua 原子仲裁，绝不超发。
+    # 份额隔离同样在 Lua 内完成：client 命中 shares 表时只扣自己的预留池。
     queue = registry.get(kid)
     if queue is not None:
         await queue.acquire(client)
     try:
         try:
-            result = await consume(kid, idem)
+            result = await consume(kid, idem, client)
         except StoreUnavailableError:
             # 记额度层重启/不可用：明确告知稍后重试，绝不“放行”也不裸 500
             return _error(503, "quota_store_unavailable", retry_after_ms=2000,

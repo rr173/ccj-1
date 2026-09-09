@@ -16,6 +16,10 @@ F_WINDOW_SECONDS = "window_seconds"  # 长周期窗口长度（秒）
 F_WINDOW_QUOTA = "window_quota"      # 长周期总量
 F_NAME = "name"
 F_CREATED_AT = "created_at"
+# 已预留给点名调用方的合计（由控制面 set_share.lua 原子维护，数据面只读）。
+# 公共池配额 = 总量 - reserved；缺省 0（未设任何份额时行为与旧版一致）。
+F_RESERVED_BURST = "reserved_burst"
+F_RESERVED_WINDOW = "reserved_window"
 
 DEFAULT_IDEM_TTL_SECONDS = 86400  # 幂等记录保留 24h
 
@@ -51,3 +55,26 @@ def dedup_key(kid: str, idempotency_key: str) -> str:
 
 def win_key(kid: str, window_seconds: int, bucket_index: int) -> str:
     return f"{{qk:{kid}}}win:{window_seconds}:{bucket_index}"
+
+
+def shares_key(kid: str) -> str:
+    """某把密钥的“点名调用方份额表”：hash，field=调用方名，
+    value=JSON {"burst_capacity":N,"window_quota":K}。
+    控制面写（set_share.lua 原子校验“Σ份额 ≤ 总量”），数据面 Lua 只读。"""
+    return f"{{qk:{kid}}}shares"
+
+
+def caller_hash(caller: str) -> str:
+    """份额计数 key 的调用方后缀。与 consume.lua / quota.lua 中的
+    redis.sha1hex(caller) 完全一致，保证两端拼出同一个 key。"""
+    return hashlib.sha1(caller.encode("utf-8")).hexdigest()
+
+
+def share_tb_key(kid: str, caller: str) -> str:
+    """点名调用方自己的令牌桶（与公共池 {qk:<kid>}tb 完全隔离）。"""
+    return f"{{qk:{kid}}}stb:{caller_hash(caller)}"
+
+
+def share_win_key(kid: str, caller: str, window_seconds: int, bucket_index: int) -> str:
+    """点名调用方自己的窗口计数桶（与公共池 {qk:<kid>}win:* 完全隔离）。"""
+    return f"{{qk:{kid}}}swin:{caller_hash(caller)}:{window_seconds}:{bucket_index}"

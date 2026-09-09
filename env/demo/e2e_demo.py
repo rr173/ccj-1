@@ -62,11 +62,24 @@ def issue_key(name: str, burst: int, refill_ms: int, win_s: int, win_q: int) -> 
     return body["key_id"], body["api_key"]
 
 
-def call_dp(api_key: str, idem: str | None = None):
+def call_dp(api_key: str, idem: str | None = None, client: str | None = None):
     headers = {"X-Api-Key": api_key}
     if idem:
         headers["Idempotency-Key"] = idem
+    if client:
+        headers["X-Client-Id"] = client
     return http("GET", f"{DP}/v1/hello", headers)
+
+
+def set_share(kid: str, caller: str, burst: int, win_q: int):
+    return http("PUT", f"{CP}/v1/keys/{kid}/shares/{caller}",
+                {"Authorization": f"Bearer {ADMIN}"},
+                {"burst_capacity": burst, "window_quota": win_q})
+
+
+def del_share(kid: str, caller: str):
+    return http("DELETE", f"{CP}/v1/keys/{kid}/shares/{caller}",
+                {"Authorization": f"Bearer {ADMIN}"})
 
 
 def quota(kid: str):
@@ -213,8 +226,112 @@ def t_auth_and_revoke() -> None:
            f"status={status}")
 
 
+def t_shares() -> None:
+    print("\n=== 7) 点名调用方份额：预留、隔离、总量约束、停用失效 ===")
+    # 总量：突发 10 / 窗口 10；refill 极慢、窗口 60s 内不滑出，全部确定性
+    kid, key = issue_key("shares", burst=10, refill_ms=100000, win_s=60, win_q=10)
+
+    s, _, b = set_share(kid, "A", 3, 3)
+    record("给 A 预留 3/3 成功", s == 200 and b["reserved"]["burst_capacity"] == 3,
+           f"{s} {b}")
+    s, _, b = set_share(kid, "B", 2, 2)
+    record("给 B 预留 2/2 成功，reserved 累计 5",
+           s == 200 and b["reserved"]["burst_capacity"] == 5, f"{s} {b}")
+
+    s, _, b = set_share(kid, "C", 6, 1)
+    record("Σ份额(3+2+6=11)超总量 10 被拒绝(409)",
+           s == 409 and b["detail"]["code"] == "exceeds_total", f"{s} {b}")
+
+    # A 用自己的 3 个，第 4 个被拒——此刻公共池 5 个一分未动
+    st = [call_dp(key, client="A")[0] for _ in range(3)]
+    s4, _, b4 = call_dp(key, client="A")
+    record("A 用完自己的 3 个后第 4 个被拒（公共池还有也不能拿），并告知等多久",
+           st == [200] * 3 and s4 == 429
+           and b4["error"]["code"] == "burst_limited"
+           and b4["error"]["retry_after_ms"] > 0,
+           f"{st}->{s4} retry_after_ms={b4.get('error', {}).get('retry_after_ms')}")
+
+    q = quota(kid)
+    record("余量视图同时看到总盘、公共池和各人份额",
+           q["burst"]["remaining"] == 7
+           and q["shared_pool"]["burst"]["remaining"] == 5
+           and {s_["caller"]: s_["burst"]["remaining"] for s_ in q["shares"]}
+           == {"A": 0, "B": 2},
+           json.dumps({"total": q["burst"], "pool": q["shared_pool"],
+                       "shares": q["shares"]}, ensure_ascii=False))
+
+    # 未点名的 C 只能用公共池 5 个，第 6 个被拒（吃不到 B 留的 2 个）
+    st = [call_dp(key, client="C")[0] for _ in range(5)]
+    s6, _, _ = call_dp(key, client="C")
+    record("未点名的 C 用光公共池 5 个后第 6 个被拒（吃不到别人留的）",
+           st == [200] * 5 and s6 == 429, f"{st}->{s6}")
+
+    # B 的预留完好：B 还能用自己的 2 个，用完第 3 个被拒
+    st = [call_dp(key, client="B")[0] for _ in range(2)]
+    s3, _, _ = call_dp(key, client="B")
+    record("B 的预留未被公共池消耗，自己用完 2 个后第 3 个被拒",
+           st == [200] * 2 and s3 == 429, f"{st}->{s3}")
+
+    # A3 + C5 + B2 = 10：总盘恰好用尽，不超发
+    q = quota(kid)
+    record("总盘恰好用尽（不超发）",
+           q["burst"]["remaining"] == 0 and q["window"]["remaining"] == 0,
+           f"burst={q['burst']['remaining']} window={q['window']['remaining']}")
+
+    # 份额的窗口维度同样独立：突发充足、窗口份额用尽
+    kid4, key4 = issue_key("shares-win", burst=100, refill_ms=1, win_s=3, win_q=10)
+    set_share(kid4, "A", 50, 2)  # A 窗口只留 2；公共池窗口 8
+    st = [call_dp(key4, client="A")[0] for _ in range(2)]
+    s3, _, b3 = call_dp(key4, client="A")
+    record("A 的窗口份额 2 用完后被 window_limited 拒绝并给出等待时间",
+           st == [200] * 2 and s3 == 429
+           and b3["error"]["code"] == "window_limited"
+           and 0 < b3["error"]["retry_after_ms"] <= 3000,
+           f"{st}->{s3} retry={b3.get('error', {}).get('retry_after_ms')}")
+    s4, _, _ = call_dp(key4, client="C")
+    record("A 的窗口份额用尽不影响公共池", s4 == 200, f"{s4}")
+
+    # 删除份额：预留回到公共池（refill 较快，等桶按新容量补满）
+    kid2, key2 = issue_key("shares-del", burst=4, refill_ms=100, win_s=60, win_q=4)
+    set_share(kid2, "A", 3, 3)  # 公共池被压缩到 1/1
+    s1 = call_dp(key2, client="C")[0]
+    time.sleep(0.15)
+    s2 = call_dp(key2, client="C")[0]
+    record("公共池被份额压缩到 1 个", s1 == 200 and s2 == 429, f"{s1}/{s2}")
+    s, _, _ = del_share(kid2, "A")
+    record("删除份额成功", s == 200, f"{s}")
+    time.sleep(0.5)  # 公共池按恢复后的容量 4 补满
+    st = [call_dp(key2, client="C")[0] for _ in range(3)]
+    s5 = call_dp(key2, client="C")[0]
+    record("删除份额后预留回到公共池（C 再用 3 个后打满）",
+           st == [200] * 3 and s5 == 429, f"{st}->{s5}")
+
+    # 停用：份额与公共池一起立即失效；停用密钥不能再设份额；余量仍可查
+    kid3, key3 = issue_key("shares-revoke", burst=6, refill_ms=100000, win_s=60, win_q=6)
+    set_share(kid3, "A", 4, 4)
+    s1 = call_dp(key3, client="A")[0]
+    http("POST", f"{CP}/v1/keys/{kid3}/revoke", {"Authorization": f"Bearer {ADMIN}"})
+    s2, _, b2 = call_dp(key3, client="A")
+    s3, _, b3 = call_dp(key3, client="C")
+    record("停用后份额与公共池都立即失效",
+           s1 == 200 and s2 == 403 and s3 == 403
+           and b2["error"]["code"] == "key_revoked"
+           and b3["error"]["code"] == "key_revoked",
+           f"{s1}->{s2}/{s3}")
+    s, _, _ = set_share(kid3, "D", 1, 1)
+    record("停用密钥拒绝新增份额(409)", s == 409, f"{s}")
+    s, _, q = http("GET", f"{CP}/v1/keys/{kid3}/quota",
+                   {"Authorization": f"Bearer {ADMIN}"})
+    record("停用后仍可查总盘与份额口径（余量 0）",
+           s == 200 and q["state"] == "revoked"
+           and q["shares"][0]["caller"] == "A"
+           and q["shares"][0]["burst"]["capacity"] == 4
+           and q["shares"][0]["burst"]["remaining"] == 0,
+           f"{s} shares={q.get('shares')}")
+
+
 def t_restart_durability(compose_file: str) -> None:
-    print("\n=== 7) 记额度层重启：两端不重启，已扣额度不丢不增、自动恢复 ===")
+    print("\n=== 8) 记额度层重启：两端不重启，已扣额度不丢不增、自动恢复 ===")
     kid, key = issue_key("durability", burst=100, refill_ms=100000, win_s=300, win_q=10)
     for _ in range(4):
         s, _, _ = call_dp(key)
@@ -260,6 +377,7 @@ def main() -> None:
     t_control_plane_view()
     t_idempotency()
     t_auth_and_revoke()
+    t_shares()
     if args.restart:
         compose = str(Path(__file__).resolve().parent.parent / "docker-compose.yml")
         t_restart_durability(compose)
