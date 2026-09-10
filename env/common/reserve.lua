@@ -26,6 +26,7 @@
 -- KEYS[3] = shares 份额配置 hash，例如 {qk:<kid>}shares（控制面写，此处只读）
 -- KEYS[4] = res    占用单 hash，例如 {qk:<kid>}res:<sha256(业务号)>（匿名调用
 --                  由数据面生成随机单号；同一业务号命中同一张单子）
+-- KEYS[5] = ledger 占用流水 Stream，例如 {qk:<kid>}ledger（只 XADD，永不修改）
 --
 -- ARGV:
 --  1  kid                密钥ID（仅用于拼窗口桶 key）
@@ -43,7 +44,8 @@
 --   {1, remaining_burst, remaining_window, lease_expires_unix}        占成功
 --   {0, reason, retry_after_ms, remaining_burst, remaining_window}    占失败
 --   {2, lease_expires_unix, outcome, remaining_burst, remaining_window} 幂等重放
---       outcome: ""（占用还在）/ "confirmed" / "released"
+--       outcome: ""（占用还在）/ "confirmed" / "released" /
+--                "timeout"（约定回音时限过了没回音，已按超时退回，不能再占）
 --   {3, error_message}                                                参数/配置错误
 --
 -- 设计要点：
@@ -61,6 +63,7 @@ local cfg_key    = KEYS[1]
 local tb_key     = KEYS[2]
 local shares_key = KEYS[3]
 local res_key    = KEYS[4]
+local ledger_key = KEYS[5]
 
 local kid             = ARGV[1]
 local capacity        = tonumber(ARGV[2])
@@ -88,6 +91,70 @@ if redis.call("EXISTS", cfg_key) == 0 then
   return {3, "key not found"}
 end
 
+-- 占用流水：只追加，绝不修改。XADD 到 per-key Stream（entry id 即 Redis
+-- 毫秒时间戳），同时按调用方 / 业务号各挂一个 ZSET 索引供翻账。
+-- reserve/settle 三条事件都在这里写，停用密钥也照样留笔（只不允许新占）。
+local function ledger_add(kind, rk, cost_val, reason, late, rfields)
+  local eid = redis.call("XADD", ledger_key, "*",
+    "kind", kind, "kid", kid,
+    "res", rk,
+    "caller", rfields.caller or "",
+    "idem", rfields.idem or "",
+    "pool", rfields.pool or "",
+    "cost", tostring(cost_val),
+    "reason", reason or "",
+    "late", late and "1" or "0",
+    "reserve_at", tostring(rfields.reserve_at_ms or 0))
+  local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
+  local caller = rfields.caller or ""
+  if caller ~= "" then
+    local ci = "{qk:" .. kid .. "}lci:" .. redis.sha1hex(caller)
+    redis.call("ZADD", ci, score, eid)
+  end
+  local idem = rfields.idem or ""
+  if idem ~= "" then
+    local ii = "{qk:" .. kid .. "}lii:" .. redis.sha1hex(idem)
+    redis.call("ZADD", ii, score, eid)
+  end
+  return eid
+end
+
+-- 把一张“过了约定回音时限还没回音”的占用单终结为超时退回：
+-- 占用登记从 ZSET 删除（额度立刻能再占），单子置 outcome="expired"，
+-- 留一笔 release/reason=timeout 流水。幂等：只处理还占着（outcome=""）
+-- 的单子；密钥已停用也照样退、照样留笔（流水在停用后仍可拉）。
+-- 迟到的真实确认随后仍可把 expired 推进为 confirmed（见 settle.lua），
+-- 不丢真实调用。
+local function finalize_expired(rkey)
+  local f = redis.call("HMGET", rkey, "outcome", "lease_exp_ms", "cost",
+                       "holds", "wholds", "caller", "idem", "pool",
+                       "reserved_at_ms")
+  local fo = f[1]
+  if not fo or fo ~= "" then
+    return false
+  end
+  local exp_ms = tonumber(f[2] or "0") or 0
+  if exp_ms > now_ms then
+    return false
+  end
+  local cost_val = tonumber(f[3] or "1") or 1
+  local members = {}
+  for i = 1, cost_val do
+    members[#members + 1] = rkey .. "#" .. i
+  end
+  if f[4] then
+    redis.call("ZREM", f[4], unpack(members))
+  end
+  if f[5] then
+    redis.call("ZREM", f[5], unpack(members))
+  end
+  redis.call("HSET", rkey, "outcome", "expired")
+  ledger_add("release", rkey, cost_val, "timeout", false,
+             {caller = f[6] or "", idem = f[7] or "", pool = f[8] or "",
+              reserve_at_ms = f[9] or "0"})
+  return true
+end
+
 -- 2) 幂等：同一业务号再来，命中同一张占用单（匿名调用单号随机，必不命中）
 if idem ~= "" then
   local prev = redis.call("HGETALL", res_key)
@@ -96,8 +163,11 @@ if idem ~= "" then
     for i = 1, #prev, 2 do h[prev[i]] = prev[i + 1] end
     local outcome = h.outcome or ""
     if outcome ~= "" then
-      -- 已了结：直接给原结论（只是回报历史，密钥停用后也一样），绝不二次占额
-      return {2, tonumber(h.lease_exp or 0), outcome,
+      -- 已了结：直接给原结论（只是回报历史，密钥停用后也一样），绝不二次占额。
+      -- 超时退回（expired）对调用方等同“这笔业务没调成，占用已退回”，
+      -- 换一个业务号才能再试——同一业务号的占/退都只记一笔。
+      local shown = outcome == "expired" and "timeout" or outcome
+      return {2, tonumber(h.lease_exp or 0), shown,
               tonumber(h.rem_burst or 0), tonumber(h.rem_window or 0)}
     end
     if tonumber(h.lease_exp_ms or "0") > now_ms then
@@ -110,8 +180,12 @@ if idem ~= "" then
       return {2, tonumber(h.lease_exp or 0), "",
               tonumber(h.rem_burst or 0), tonumber(h.rem_window or 0)}
     end
-    -- 占用已超约定时限还没回音：旧占用登记已失效（额度已退回池里），
-    -- 按同一业务号重新占一次——单子还是这张单子，确认仍只生效一次。
+    -- 占用已超约定时限还没回音：先按超时退回旧占用（留 timeout 流水，额度回池），
+    -- 再以“这笔业务已了结为退回”拒绝重占。同一业务号的占、退各只有一笔，
+    -- 再来不能再记；迟到的真实回音若赶到仍会补 confirmed（settle.lua）。
+    finalize_expired(res_key)
+    return {2, tonumber(h.lease_exp or 0), "timeout",
+            tonumber(h.rem_burst or 0), tonumber(h.rem_window or 0)}
   end
 end
 
@@ -160,9 +234,29 @@ else
   pool = "shared"
 end
 
--- 5) 清掉已过约定回音时限的占用登记：没回音的占额自动退回，别人可再占
-redis.call("ZREMRANGEBYSCORE", holds_key, "-inf", now_ms)
-redis.call("ZREMRANGEBYSCORE", wholds_key, "-inf", now_ms)
+-- 5) 清掉已过约定回音时限的占用登记：没回音的占额自动退回，别人可再占。
+--    清出来的 member 找到对应占用单，把还挂着 outcome="" 的单子终结为
+--    超时退回并留一笔 release/timeout 流水（幂等；两个 ZSET 各清一遍，
+--    finalize_expired 自身按单子状态去重）。
+local function sweep_holds(zkey)
+  local expired_members = redis.call("ZRANGEBYSCORE", zkey, "-inf", now_ms)
+  if #expired_members > 0 then
+    redis.call("ZREMRANGEBYSCORE", zkey, "-inf", now_ms)
+    local seen = {}
+    for _, m in ipairs(expired_members) do
+      local cut = string.find(m, "#", 1, true)
+      if cut then
+        local rkey = string.sub(m, 1, cut - 1)
+        if not seen[rkey] then
+          seen[rkey] = true
+          finalize_expired(rkey)
+        end
+      end
+    end
+  end
+end
+sweep_holds(holds_key)
+sweep_holds(wholds_key)
 local held_burst  = redis.call("ZCARD", holds_key)
 local held_window = redis.call("ZCARD", wholds_key)
 
@@ -259,6 +353,7 @@ redis.call("HSET", res_key,
   "kid", kid,
   "pool", pool,
   "caller", client,
+  "idem", idem,
   "cost", cost,
   "tb", eff_tb_key,
   "win_prefix", win_prefix,
@@ -269,9 +364,16 @@ redis.call("HSET", res_key,
   "win_seconds", window_seconds,
   "lease_exp", lease_exp,
   "lease_exp_ms", lease_exp_ms,
+  "reserved_at_ms", now_ms,
   "rem_burst", new_rem_burst,
   "rem_window", new_rem_window,
   "outcome", "")
+-- 占用流水：占成功就留一笔（与占用登记在同一原子动作里落盘）。
+-- 之后 confirm/release 由 settle.lua 各留一笔；同一业务号状态机保证
+-- 每种结局只记一次，再来只回原结论、不再留笔。
+ledger_add("reserve", res_key, cost, "", false,
+           {caller = client, idem = idem, pool = pool,
+            reserve_at_ms = now_ms})
 -- 占用单留存：带业务号的留 24h（与旧版幂等记录一致），期间同一业务号重放
 -- 都能拿到原结论；匿名单子没人会按号查，留到约定回音时限加宽限即可。
 -- 注意：占用的“额度效力”只到约定回音时限（ZSET score），单子本身留得再久

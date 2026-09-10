@@ -86,3 +86,25 @@ def share_tb_key(kid: str, caller: str) -> str:
 def share_win_key(kid: str, caller: str, window_seconds: int, bucket_index: int) -> str:
     """点名调用方自己的窗口计数桶（与公共池 {qk:<kid>}win:* 完全隔离）。"""
     return f"{{qk:{kid}}}swin:{caller_hash(caller)}:{window_seconds}:{bucket_index}"
+
+
+# ── 占用流水（只追加账本）──────────────────────────────────────────────────
+# 每把密钥一条 Redis Stream：占（reserve）/ 调成（confirm）/ 退回（release）
+# 各 XADD 一笔，与计数变更在同一段 Lua 内原子落盘。Stream 没有修改单条的
+# 命令，代码里也从不 XDEL/XTRIM——留下之后不能改；停用密钥不删流水，
+# AOF(appendfsync always) 保证重启后流水还在。
+def ledger_stream_key(kid: str) -> str:
+    """占用流水主表：Redis Stream，entry id 即 Redis 服务器毫秒时间戳。"""
+    return f"{{qk:{kid}}}ledger"
+
+
+def ledger_caller_key(kid: str, caller: str) -> str:
+    """按调用方的流水索引：ZSET，member=stream entry id，score=毫秒时间戳。
+    与 Lua 内 redis.sha1hex(caller) 的拼法一致。"""
+    return f"{{qk:{kid}}}lci:{caller_hash(caller)}"
+
+
+def ledger_idem_key(kid: str, idem: str) -> str:
+    """按业务号（Idempotency-Key）的流水索引：ZSET，同上。
+    一个业务号至多占/结/退三笔，用 sha1 与 Lua 侧 redis.sha1hex 对齐。"""
+    return f"{{qk:{kid}}}lii:{hashlib.sha1(idem.encode('utf-8')).hexdigest()}"
