@@ -6,6 +6,10 @@
   2. python3 demo/e2e_demo.py
   3. 带 --restart 时额外验证 Redis 重启后已扣额度不丢不增
      （需要本机能执行 `docker compose`，会重启 redis 容器）
+
+覆盖：先占后调（成了才真扣、没调成退回、超时未回音自动退回）、占着别人
+不能拿、占不住告知等多久、余量能看到“还占着/真用掉”、同一业务号幂等、
+停用后占着的也不能确认、点名调用方份额隔离、公平性、持久化。
 """
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -41,7 +46,7 @@ def http(method: str, url: str, headers: dict | None = None, body: dict | None =
         h.update(headers)
     req = urllib.request.Request(url, data=data, headers=h, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             return resp.status, dict(resp.headers), json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as e:
         raw = e.read()
@@ -62,13 +67,14 @@ def issue_key(name: str, burst: int, refill_ms: int, win_s: int, win_q: int) -> 
     return body["key_id"], body["api_key"]
 
 
-def call_dp(api_key: str, idem: str | None = None, client: str | None = None):
+def call_dp(api_key: str, idem: str | None = None, client: str | None = None,
+            path: str = "/v1/hello"):
     headers = {"X-Api-Key": api_key}
     if idem:
         headers["Idempotency-Key"] = idem
     if client:
         headers["X-Client-Id"] = client
-    return http("GET", f"{DP}/v1/hello", headers)
+    return http("GET", f"{DP}{path}", headers)
 
 
 def set_share(kid: str, caller: str, burst: int, win_q: int):
@@ -113,7 +119,7 @@ def t_burst_limit() -> None:
         elif status == 429:
             retry_ms = body["error"]["retry_after_ms"]
             retry_hdr = headers.get("Retry-After")
-            record("突发打满后立即拒绝且码为 burst_limited",
+            record("突发占满后立即拒绝且码为 burst_limited",
                    body["error"]["code"] == "burst_limited"
                    and retry_ms > 0 and retry_hdr is not None,
                    f"retry_after_ms={retry_ms}, Retry-After={retry_hdr}, "
@@ -184,27 +190,125 @@ def t_control_plane_view() -> None:
     for _ in range(3):
         call_dp(key)
     q = quota(kid)
-    ok = q["state"] == "active" and q["burst"]["remaining"] == 7 and q["window"]["remaining"] == 5
-    record("扣减后控制面只读视图准确", ok, json.dumps(q, ensure_ascii=False))
+    ok = (q["state"] == "active"
+          and q["burst"]["remaining"] == 7 and q["window"]["remaining"] == 5
+          and q["burst"]["held"] == 0 and q["burst"]["consumed"] == 3
+          and q["window"]["held"] == 0 and q["window"]["consumed"] == 3)
+    record("确认后控制面只读视图准确（可再占/还占着/真用掉 三种状态）",
+           ok, json.dumps(q, ensure_ascii=False))
+
+
+def t_reservation_lifecycle() -> None:
+    print("\n=== 5) 先占后调：占着别人不能拿、没调成退回、超时自动退回 ===")
+    # 5a. 调用进行中：额度显示“还占着”，别人占不走；调成后才算真用掉
+    kid, key = issue_key("lifecycle", burst=2, refill_ms=100000, win_s=60, win_q=10)
+    done: list = []
+
+    def slow_call():
+        done.append(call_dp(key, path="/slow?ms=1500"))
+
+    th = threading.Thread(target=slow_call)
+    th.start()
+    time.sleep(0.4)  # 等它占上、正在调上游
+    q = quota(kid)
+    record("调用进行中：余量里看得到“还占着 1 个”，还没真用掉",
+           q["burst"]["held"] == 1 and q["burst"]["consumed"] == 0
+           and q["burst"]["remaining"] == 1,
+           json.dumps(q["burst"], ensure_ascii=False))
+    th.join()
+    record("慢调用最终成功", done and done[0][0] == 200, f"{done}")
+    q = quota(kid)
+    record("调成后：占用转为“真用掉”，还占着归零",
+           q["burst"]["held"] == 0 and q["burst"]["consumed"] == 1
+           and q["burst"]["remaining"] == 1,
+           json.dumps(q["burst"], ensure_ascii=False))
+
+    # 5b. 上游没调成：占着的额度退回去，不算用掉
+    kid2, key2 = issue_key("lifecycle-fail", burst=5, refill_ms=100000, win_s=60, win_q=10)
+    s, _, b = call_dp(key2, path="/fail")
+    q2 = quota(kid2)
+    record("上游 500：返回 502，且占着的额度已退回（没调成不算用掉）",
+           s == 502 and b["error"]["code"] == "upstream_unavailable"
+           and q2["burst"]["held"] == 0 and q2["burst"]["consumed"] == 0
+           and q2["burst"]["remaining"] == 5 and q2["window"]["consumed"] == 0,
+           f"status={s} burst={q2['burst']} window={q2['window']}")
+
+    # 5c. 过了约定回音时限没回音：占着的自动退回，别人能占
+    kid3, key3 = issue_key("lifecycle-lease", burst=1, refill_ms=100000, win_s=60, win_q=10)
+    done3: list = []
+
+    def hanging_call():
+        done3.append(call_dp(key3, path="/slow?ms=7000"))
+
+    th3 = threading.Thread(target=hanging_call)
+    th3.start()
+    time.sleep(0.5)
+    s_blocked, _, b_blocked = call_dp(key3)
+    record("占用期间别人占不走（burst_limited 并告知等多久）",
+           s_blocked == 429 and b_blocked["error"]["code"] == "burst_limited"
+           and b_blocked["error"]["retry_after_ms"] > 0,
+           f"status={s_blocked} retry={b_blocked.get('error', {}).get('retry_after_ms')}")
+    # 轮询等占用超约定时限自动退回（数据面环境变量 RESERVATION_TTL_SECONDS，演示为 5s）
+    released_at = None
+    for _ in range(180):
+        q3 = quota(kid3)
+        if q3["burst"]["held"] == 0:
+            released_at = time.time()
+            break
+        time.sleep(0.5)
+    record("过了约定回音时限，占着的自动退回（还占着归零）",
+           released_at is not None,
+           f"held={q3['burst']['held']}")
+    s_after, _, _ = call_dp(key3)
+    record("退回后别人立刻能占（调用成功）", s_after == 200, f"status={s_after}")
+    th3.join()
+    q3 = quota(kid3)
+    record("迟到的上游回音仍按真实调用记一笔（窗口真用掉=2，不重复、不丢失）",
+           done3 and done3[0][0] == 200
+           and q3["window"]["consumed"] == 2 and q3["window"]["held"] == 0,
+           f"slow_call={done3} window={q3['window']}")
 
 
 def t_idempotency() -> None:
-    print("\n=== 5) 幂等键：重试不重复扣额度 ===")
+    print("\n=== 6) 同一业务号：不再占一次 ===")
     kid, key = issue_key("idem", burst=10, refill_ms=100000, win_s=60, win_q=10)
     s1, _, b1 = call_dp(key, idem="order-123")
     s2, _, b2 = call_dp(key, idem="order-123")
     s3, _, _ = call_dp(key, idem="order-123")
-    record("首次放行，重放返回 409 且不再扣减",
+    record("首次调成，同一业务号再来返回 409 且不再占",
            s1 == 200 and s2 == 409 and s3 == 409
-           and b2["error"]["code"] == "idempotent_replay_allowed",
+           and b2["error"]["code"] == "idempotent_replay_confirmed",
            f"{s1}/{s2}/{s3}")
     q = quota(kid)
-    record("三次请求只扣 1 个额度", q["burst"]["remaining"] == 9,
-           f"remaining={q['burst']['remaining']}")
+    record("三次请求只真用掉 1 个额度",
+           q["burst"]["consumed"] == 1 and q["burst"]["held"] == 0,
+           f"burst={q['burst']}")
+
+    # 同一业务号在“还占着”期间并发再来：命中同一张占用单，只算一笔
+    kid2, key2 = issue_key("idem-inflight", burst=10, refill_ms=100000, win_s=60, win_q=10)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futs = [pool.submit(call_dp, key2, "order-456", None, "/slow?ms=800")
+                for _ in range(2)]
+        sts = [f.result()[0] for f in futs]
+    q2 = quota(kid2)
+    record("占用在飞时同一业务号并发再来：都成功但只真用掉 1 个",
+           sts == [200, 200] and q2["burst"]["consumed"] == 1,
+           f"statuses={sts} burst={q2['burst']}")
+
+    # 没调成的业务号：占用已退回，重放如实告知，换新业务号才能再试
+    kid3, key3 = issue_key("idem-fail", burst=10, refill_ms=100000, win_s=60, win_q=10)
+    sf1, _, _ = call_dp(key3, idem="order-789", path="/fail")
+    sf2, _, bf2 = call_dp(key3, idem="order-789")
+    q3 = quota(kid3)
+    record("没调成的业务号：额度已退回，重放返回 409 idempotent_replay_released",
+           sf1 == 502 and sf2 == 409
+           and bf2["error"]["code"] == "idempotent_replay_released"
+           and q3["burst"]["consumed"] == 0 and q3["burst"]["held"] == 0,
+           f"{sf1}/{sf2} burst={q3['burst']}")
 
 
 def t_auth_and_revoke() -> None:
-    print("\n=== 6) 无密钥拒绝 + 停用立即生效 ===")
+    print("\n=== 7) 无密钥拒绝 + 停用立即生效 + 停用后占着的不能确认 ===")
     status, _, _ = http("GET", f"{DP}/v1/hello")
     record("缺少密钥返回 401", status == 401, f"status={status}")
 
@@ -225,9 +329,41 @@ def t_auth_and_revoke() -> None:
            and qbody["burst"]["refill_per_second"] is not None,
            f"status={status}")
 
+    # 停用发生在“还占着”的时候：这笔占用不能再被当成调成
+    kid2, key2 = issue_key("revoke-inflight", burst=5, refill_ms=100000, win_s=60, win_q=10)
+    done: list = []
+
+    def slow_call():
+        done.append(call_dp(key2, path="/slow?ms=1500"))
+
+    th = threading.Thread(target=slow_call)
+    th.start()
+    time.sleep(0.4)  # 已占上、正在调上游
+    http("POST", f"{CP}/v1/keys/{kid2}/revoke", {"Authorization": f"Bearer {ADMIN}"})
+    th.join()
+    q2 = quota(kid2)
+    record("占用在飞时停用：上游虽调成，但确认被拒——不计入真用掉",
+           done and done[0][0] == 200
+           and q2["state"] == "revoked"
+           and q2["burst"]["consumed"] == 0 and q2["window"]["consumed"] == 0,
+           f"call={done} burst={q2['burst']}")
+    record("停用后在占的额度仍如实展示（等约定时限自动退回）",
+           q2["burst"]["held"] == 1, f"held={q2['burst']['held']}")
+    s_new, _, _ = call_dp(key2)
+    record("停用后新调用立即 403", s_new == 403, f"status={s_new}")
+    # 等占用超约定时限自动退回
+    expired = False
+    for _ in range(180):
+        if quota(kid2)["burst"]["held"] == 0:
+            expired = True
+            break
+        time.sleep(0.5)
+    record("约定时限到，停用密钥上占着的也自动退回（不会占死）",
+           expired, f"held={quota(kid2)['burst']['held']}")
+
 
 def t_shares() -> None:
-    print("\n=== 7) 点名调用方份额：预留、隔离、总量约束、停用失效 ===")
+    print("\n=== 8) 点名调用方份额：预留、隔离、总量约束、停用失效 ===")
     # 总量：突发 10 / 窗口 10；refill 极慢、窗口 60s 内不滑出，全部确定性
     kid, key = issue_key("shares", burst=10, refill_ms=100000, win_s=60, win_q=10)
 
@@ -260,7 +396,7 @@ def t_shares() -> None:
            json.dumps({"total": q["burst"], "pool": q["shared_pool"],
                        "shares": q["shares"]}, ensure_ascii=False))
 
-    # 未点名的 C 只能用公共池 5 个，第 6 个被拒（吃不到 B 留的 2 个）
+    # 未点名的 C 只能用公共池 5 个，第 6 个被拒（吃不到别人留的）
     st = [call_dp(key, client="C")[0] for _ in range(5)]
     s6, _, _ = call_dp(key, client="C")
     record("未点名的 C 用光公共池 5 个后第 6 个被拒（吃不到别人留的）",
@@ -331,7 +467,7 @@ def t_shares() -> None:
 
 
 def t_restart_durability(compose_file: str) -> None:
-    print("\n=== 8) 记额度层重启：两端不重启，已扣额度不丢不增、自动恢复 ===")
+    print("\n=== 9) 记额度层重启：两端不重启，已扣额度不丢不增、自动恢复 ===")
     kid, key = issue_key("durability", burst=100, refill_ms=100000, win_s=300, win_q=10)
     for _ in range(4):
         s, _, _ = call_dp(key)
@@ -375,6 +511,7 @@ def main() -> None:
     t_window_limit()
     t_fairness()
     t_control_plane_view()
+    t_reservation_lifecycle()
     t_idempotency()
     t_auth_and_revoke()
     t_shares()

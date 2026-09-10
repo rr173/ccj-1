@@ -21,7 +21,8 @@ F_CREATED_AT = "created_at"
 F_RESERVED_BURST = "reserved_burst"
 F_RESERVED_WINDOW = "reserved_window"
 
-DEFAULT_IDEM_TTL_SECONDS = 86400  # 幂等记录保留 24h
+DEFAULT_RESERVATION_TTL_SECONDS = 60  # 占用约定的回音时限：超时未了结，
+                                      # 占着的额度自动退回池里给别人用
 
 
 def new_api_key() -> str:
@@ -48,9 +49,16 @@ def tb_key(kid: str) -> str:
     return f"{{qk:{kid}}}tb"
 
 
-def dedup_key(kid: str, idempotency_key: str) -> str:
-    h = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
-    return f"{{qk:{kid}}}dedup:{h}"
+def reservation_key(kid: str, idempotency_key: str = "") -> str:
+    """占用单 key：一笔占用（先占额度、回音后了结）的凭据。
+
+    带业务号（Idempotency-Key）时以业务号命名：同一业务号再来，命中同一张
+    占用单，绝不二次占额；没带业务号时用随机串，一次调用一张单子。
+    """
+    if idempotency_key:
+        h = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        return f"{{qk:{kid}}}res:{h}"
+    return f"{{qk:{kid}}}res:{secrets.token_hex(16)}"
 
 
 def win_key(kid: str, window_seconds: int, bucket_index: int) -> str:
@@ -65,7 +73,7 @@ def shares_key(kid: str) -> str:
 
 
 def caller_hash(caller: str) -> str:
-    """份额计数 key 的调用方后缀。与 consume.lua / quota.lua 中的
+    """份额计数 key 的调用方后缀。与 reserve.lua / quota.lua 中的
     redis.sha1hex(caller) 完全一致，保证两端拼出同一个 key。"""
     return hashlib.sha1(caller.encode("utf-8")).hexdigest()
 

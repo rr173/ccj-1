@@ -1,7 +1,8 @@
-"""控制面：签发、停用调用密钥，查看当前窗口剩余额度。
+"""控制面：签发、停用调用密钥，查看当前额度（可再占 / 还占着 / 真用掉）。
 
-控制面只写“配置 hash”，从不写令牌桶 / 窗口计数——已发生的扣减只由数据面
-通过 Lua 原子写入。两边对不上时，以这些已经对外生效的扣减计数为准。
+控制面只写“配置 hash”，从不写令牌桶 / 窗口计数 / 占用登记——已发生的占用
+与扣减只由数据面通过 Lua 原子写入。两边对不上时，以这些已经对外生效的
+计数为准。
 """
 from __future__ import annotations
 
@@ -156,11 +157,17 @@ def revoke_key(kid: str) -> dict:
 
 @app.get("/v1/keys/{kid}/quota", dependencies=[Depends(require_admin)])
 def get_quota(kid: str) -> dict:
-    """只读查看当前剩余：总盘 + 公共池 + 各点名调用方份额，一次看齐。
+    """只读查看当前额度：总盘 + 公共池 + 各点名调用方份额，一次看齐。
 
-    顶层 burst/window 是整把密钥的总盘余量（公共池 + 各份额之和，上限为密钥
-    总量）；shared_pool 是未点名调用方可用的部分；shares 逐人列出配额与余量。
-    停用后的密钥仍可查询：返回 state=revoked 与其配置/余量口径，不报错。
+    每个视角都给出三种状态的数量，占着的和真用掉的一眼分清：
+      * remaining 可再占：现在还能被占走的部分；
+      * held      还占着：已预占、还没回音的——别人现在拿不走，没调成或
+                  过了约定回音时限会退回来；
+      * consumed  真用掉：已确认调成、沉在计数里的（= 配额 − 可再占 − 还占着）。
+
+    顶层 burst/window 是整把密钥的总盘（公共池 + 各份额之和，上限为密钥
+    总量）；shared_pool 是未点名调用方可用的部分；shares 逐人列出。
+    停用后的密钥仍可查询：返回 state=revoked 与其配置/在占口径，余量为 0。
     """
     cfg = _load_config(kid)
     if cfg is None:
@@ -181,45 +188,60 @@ def get_quota(kid: str) -> dict:
             redis.exceptions.BusyLoadingError) as exc:
         raise QuotaStoreUnavailable() from exc
 
-    (state, rem_b_total, rem_w_total, win_s, refill_ms, capacity, win_quota,
-     reserved_b, reserved_w, pool_rem_b, pool_rem_w, n_shares) = res[:12]
+    (state, rem_b_total, rem_w_total, held_b_total, held_w_total,
+     win_s, refill_ms, capacity, win_quota,
+     reserved_b, reserved_w,
+     pool_rem_b, pool_rem_w, pool_held_b, pool_held_w, n_shares) = res[:16]
     refill_ms = int(refill_ms)
     capacity, win_quota = int(capacity), int(win_quota)
     reserved_b, reserved_w = int(reserved_b), int(reserved_w)
+    revoked = state == "revoked"
+
+    def view(cap_: int, quota_: int, rem_b: int, rem_w: int,
+             held_b: int, held_w: int) -> dict:
+        # quota.lua 给的是自然口径（停用也照算）。展示层约定：
+        #   * 可再占（remaining）：停用即 0——份额与公共池立即失效；
+        #   * 还占着（held）     ：照实——占用单还在，等约定时限自动退回；
+        #   * 真用掉（consumed） ：按自然口径 配额 − 自然余量 − 还占着，
+        #     停用不会把已经真用掉的账抹掉。
+        rem_b, rem_w = max(0, int(rem_b)), max(0, int(rem_w))
+        held_b, held_w = max(0, int(held_b)), max(0, int(held_w))
+        consumed_b = max(0, cap_ - rem_b - held_b)
+        consumed_w = max(0, quota_ - rem_w - held_w)
+        if revoked:
+            rem_b, rem_w = 0, 0
+        return {
+            "burst": {"capacity": cap_, "remaining": rem_b, "held": held_b,
+                      "consumed": consumed_b},
+            "window": {"quota": quota_, "remaining": rem_w, "held": held_w,
+                       "consumed": consumed_w},
+        }
 
     shares = []
     for i in range(int(n_shares)):
-        base = 12 + i * 5
-        caller, s_cap, s_win_q, s_rem_b, s_rem_w = res[base:base + 5]
+        base = 16 + i * 7
+        caller, s_cap, s_win_q, s_rem_b, s_rem_w, s_held_b, s_held_w = res[base:base + 7]
         shares.append({
             "caller": caller,
-            "burst": {"capacity": int(s_cap), "remaining": max(0, int(s_rem_b))},
-            "window": {"quota": int(s_win_q), "remaining": max(0, int(s_rem_w))},
+            **view(int(s_cap), int(s_win_q), s_rem_b, s_rem_w, s_held_b, s_held_w),
         })
+
+    pool = view(capacity - reserved_b, win_quota - reserved_w,
+                pool_rem_b, pool_rem_w, pool_held_b, pool_held_w)
+    total = view(capacity, win_quota, rem_b_total, rem_w_total,
+                 held_b_total, held_w_total)
 
     return {
         "key_id": kid,
         "state": state,
-        "burst": {
-            "capacity": capacity,
-            "remaining": max(0, int(rem_b_total)),
-            "refill_per_second": round(1000.0 / refill_ms, 3) if refill_ms > 0 else None,
-        },
-        "window": {
-            "seconds": int(win_s),
-            "quota": win_quota,
-            "remaining": max(0, int(rem_w_total)),
-        },
+        "burst": {**total["burst"],
+                  "refill_per_second": round(1000.0 / refill_ms, 3) if refill_ms > 0 else None},
+        "window": {"seconds": int(win_s), **total["window"]},
         "reserved": {
             "burst_capacity": reserved_b,
             "window_quota": reserved_w,
         },
-        "shared_pool": {
-            "burst": {"capacity": capacity - reserved_b,
-                      "remaining": max(0, int(pool_rem_b))},
-            "window": {"quota": win_quota - reserved_w,
-                       "remaining": max(0, int(pool_rem_w))},
-        },
+        "shared_pool": pool,
         "shares": shares,
     }
 

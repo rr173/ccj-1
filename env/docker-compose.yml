@@ -40,6 +40,9 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       UPSTREAM_URL: http://upstream:8000
+      # 占用约定的回音时限：超时未确认/未退回，占着的额度自动退回池里。
+      # 演示环境调小便于观察超时退回；生产应大于上游总超时（默认 60s）
+      RESERVATION_TTL_SECONDS: "5"
     ports:
       - "8080:8080"
     depends_on:
