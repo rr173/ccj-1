@@ -50,6 +50,10 @@ MAX_KEY_LOCKS = int(os.environ.get("MAX_KEY_LOCKS", "100000"))
 # 必须大于上游调用的总超时（30s），否则慢上游会被误判为失联
 RESERVATION_TTL_SECONDS = int(os.environ.get(
     "RESERVATION_TTL_SECONDS", str(keys.DEFAULT_RESERVATION_TTL_SECONDS)))
+# 后台兜底扫描周期（秒）：把各池里“过了约定回音时限还没回音”的占用单
+# 终结为超时退回并留流水。热池在 reserve.lua 判定时顺手清理，这个任务只
+# 兜住之后再没人来占的冷池。
+SWEEP_INTERVAL_SECONDS = float(os.environ.get("SWEEP_INTERVAL_SECONDS", "2"))
 
 COMMON_DIR = Path(__file__).resolve().parent.parent / "common"
 
@@ -78,14 +82,17 @@ registry = KeyLockRegistry(MAX_KEY_LOCKS)
 redis_client: aioredis.Redis = None  # type: ignore
 _RESERVE_SRC = (COMMON_DIR / "reserve.lua").read_text(encoding="utf-8")
 _SETTLE_SRC = (COMMON_DIR / "settle.lua").read_text(encoding="utf-8")
+_SWEEP_SRC = (COMMON_DIR / "sweep.lua").read_text(encoding="utf-8")
 # SHA 放在可变 dict 里：Redis 重启清空脚本缓存后由 script_runner 重载刷新，
 # 无需重启数据面进程
 _reserve_sha: dict = {"sha": None}
 _settle_sha: dict = {"sha": None}
+_sweep_sha: dict = {"sha": None}
+_sweep_task: asyncio.Task | None = None
 
 
 async def init_redis(app: web.Application) -> None:
-    global redis_client
+    global redis_client, _sweep_task
     redis_client = aioredis.Redis.from_url(REDIS_URL, decode_responses=True)
     app["upstream"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
     # 短暂等待 Redis 就绪（正常容器编排下很快）；等不到也不退出，
@@ -97,9 +104,16 @@ async def init_redis(app: web.Application) -> None:
         except (aioredis.ConnectionError, OSError):
             pass
         await asyncio.sleep(1)
+    _sweep_task = asyncio.create_task(sweep_loop())
 
 
 async def close_redis(app: web.Application) -> None:
+    if _sweep_task is not None:
+        _sweep_task.cancel()
+        try:
+            await _sweep_task
+        except asyncio.CancelledError:
+            pass
     await app["upstream"].close()
     if redis_client is not None:
         await redis_client.aclose()
@@ -154,10 +168,11 @@ async def reserve(kid: str, idem: str, client: str, res_key: str) -> list:
         RESERVATION_TTL_SECONDS,
         client,
     ]
-    lua_keys = [keys.cfg_key(kid), keys.tb_key(kid), keys.shares_key(kid), res_key]
+    lua_keys = [keys.cfg_key(kid), keys.tb_key(kid), keys.shares_key(kid),
+                res_key, keys.ledger_stream_key(kid)]
     try:
         return await run_script_async(
-            redis_client, _RESERVE_SRC, _reserve_sha, 4,
+            redis_client, _RESERVE_SRC, _reserve_sha, 5,
             [*lua_keys, *args])
     except (aioredis.ConnectionError, aioredis.TimeoutError,
             aioredis.BusyLoadingError) as exc:
@@ -172,11 +187,60 @@ async def settle(kid: str, res_key: str, action: str, force: bool) -> list | Non
     """
     try:
         return await run_script_async(
-            redis_client, _SETTLE_SRC, _settle_sha, 2,
-            [keys.cfg_key(kid), res_key, action, "1" if force else "0"])
+            redis_client, _SETTLE_SRC, _settle_sha, 3,
+            [keys.cfg_key(kid), res_key, keys.ledger_stream_key(kid),
+             action, "1" if force else "0"])
     except (aioredis.ConnectionError, aioredis.TimeoutError,
             aioredis.BusyLoadingError, aioredis.ResponseError):
         return None
+
+
+async def sweep_once() -> int:
+    """把所有池里过期未回音的占用单终结为超时退回（sweep.lua）。
+
+    公共池突发占用登记 {qk:*}holds；份额池 {qk:*}sholds:<sha1>。
+    窗口占用登记（wholds/swholds）里的单子必然也在对应的突发登记里，
+    扫一套就够。SCAN 分批枚举池，每池单脚本最多处理 100 笔，避免长尾拖太久。
+    """
+    finalized = 0
+    try:
+        async for hkey in _scan_holds():
+            try:
+                res = await run_script_async(
+                    redis_client, _SWEEP_SRC, _sweep_sha, 1,
+                    [hkey, "100"])
+                finalized += int(res[0])
+            except (aioredis.ConnectionError, aioredis.TimeoutError,
+                    aioredis.BusyLoadingError, aioredis.ResponseError):
+                break  # 存储不可用：下一轮再来
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # 兜底任务不能因为一次意外把整个循环带崩
+        return finalized
+    return finalized
+
+
+async def _scan_holds():
+    """枚举所有突发占用登记 key（公共池 + 各份额池）。"""
+    seen = set()
+    for pattern in ("{qk:*}holds", "{qk:*}sholds:*"):
+        async for k in redis_client.scan_iter(match=pattern, count=200):
+            if k not in seen:
+                seen.add(k)
+                yield k
+
+
+async def sweep_loop() -> None:
+    """周期性兜底：冷池（之后再没人来占）的过期占用也要被终结、留流水。"""
+    while True:
+        try:
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+            await sweep_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(1)
 
 
 async def handle_proxy(request: web.Request) -> web.Response:
@@ -230,10 +294,17 @@ async def handle_proxy(request: web.Request) -> web.Response:
             return _error(409, "idempotent_replay_released",
                           remaining_burst=rem_burst, remaining_window=rem_window,
                           detail="request with this Idempotency-Key failed upstream and its reservation was released; use a new Idempotency-Key to retry")
+        if outcome == "timeout":
+            # 约定回音时限过了没回音，占用已按超时退回（流水里有 release/
+            # timeout 一笔）。同一业务号不能再占——换新业务号再试。
+            # 迟到的真实回音若已赶到，reserve.lua 会返回 confirmed 而不是这里。
+            return _error(409, "idempotent_replay_timeout",
+                          remaining_burst=rem_burst, remaining_window=rem_window,
+                          detail="request with this Idempotency-Key timed out before settlement and its reservation was released; use a new Idempotency-Key to retry")
         # outcome == ""：占用还在约定回音时限内（上次可能调到一半数据面崩了，
         # 调用方在重试）。直接带着这张占用单调上游，调完照常了结——
-        # 同一笔业务只算一次。（若占用已超时限，reserve.lua 会按同一业务号
-        # 重新占好并返回 code=1，走不到这里。）
+        # 同一笔业务只算一次。（若占用已超时限，reserve.lua 会终结旧占用、
+        # 返回 timeout，走不到这里。）
         return await forward_and_settle(request, kid, res_key,
                                         rem_burst, rem_window)
 

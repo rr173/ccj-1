@@ -13,12 +13,13 @@ from pathlib import Path
 from typing import Optional
 
 import redis
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from common import keys
 from common.script_runner import run_script_sync
+from control_plane import ledger as ledger_mod
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 # 管理面访问令牌：生产环境应走正式的管理员鉴权，这里用静态 Bearer 演示边界
@@ -244,6 +245,73 @@ def get_quota(kid: str) -> dict:
         "shared_pool": pool,
         "shares": shares,
     }
+
+
+@app.get("/v1/keys/{kid}/ledger", dependencies=[Depends(require_admin)])
+def get_ledger(
+    kid: str,
+    start: Optional[float] = Query(default=None, description="起（含），unix 秒/毫秒"),
+    end: Optional[float] = Query(default=None, description="止（不含），unix 秒/毫秒"),
+    caller: Optional[str] = Query(default=None, description="按调用方过滤（X-Client-Id）"),
+    idem_key: Optional[str] = Query(default=None, alias="idem_key",
+                                    description="按业务号过滤（Idempotency-Key）"),
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    limit: int = Query(default=ledger_mod.PAGE_DEFAULT, ge=1, le=ledger_mod.PAGE_MAX),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """翻占用流水：占到 / 调成 / 退回每一步一笔，只追加、不可改。
+
+    按密钥查（路径里的 kid）；可叠加按调用方、按业务号、按时间段过滤。
+    停用密钥、服务重启后流水都还在。时间参数给秒或毫秒都行（>1e11 按毫秒）。
+    """
+    cfg = _load_config(kid)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="key not found")
+    try:
+        out = ledger_mod.list_events(
+            r, kid, start=start, end=end, caller=caller, idem=idem_key,
+            order=order, limit=limit, offset=offset)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    out["state"] = "revoked" if cfg.get(keys.F_REVOKED) == "1" else "active"
+    return out
+
+
+@app.get("/v1/keys/{kid}/statement", dependencies=[Depends(require_admin)])
+def get_statement(
+    kid: str,
+    start: float = Query(..., description="账单起点（含），unix 秒/毫秒"),
+    end: float = Query(..., description="账单终点（不含），unix 秒/毫秒"),
+    caller: Optional[str] = Query(default=None, description="只出某调用方的账"),
+) -> dict:
+    """拉 [start, end) 的对账单：
+
+    - totals.reserved：这段占过多少（每笔 reserve 流水）
+    - totals.confirmed：真用掉多少（每笔 confirm 流水；confirmed_late 是
+      约定时限过后才赶到的迟到确认，单独列出）
+    - totals.released：退回多少（released_upstream=没调成即时退，
+      released_timeout=过了约定时限没回音自动退）
+    - held_open：还占着的单独列（in_range 的与更早挂过来的分开），
+      这些不算进真用掉
+    - reconciliation：流水侧真用掉（confirm）与余量计数侧真用掉
+      （win/swin 固定桶，和 GET /quota 同一批 key）对账；对不上时 matched=false
+      且 ledger_confirmed / counter_consumed 两边的数都亮出，并给 difference
+      与可能原因（迟到确认 / 计数桶已过 TTL / 不可归因）。
+    """
+    cfg = _load_config(kid)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="key not found")
+    try:
+        return ledger_mod.build_statement(
+            r, kid, cfg, start=start, end=end, caller=caller)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
 
 
 @app.put("/v1/keys/{kid}/shares/{caller}", dependencies=[Depends(require_admin)])

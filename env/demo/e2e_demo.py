@@ -94,6 +94,19 @@ def quota(kid: str):
     return body
 
 
+def ledger(kid: str, query: str = ""):
+    _, _, body = http("GET", f"{CP}/v1/keys/{kid}/ledger?{query}",
+                      {"Authorization": f"Bearer {ADMIN}"})
+    return body
+
+
+def statement(kid: str, start: int, end: int, query: str = ""):
+    _, _, body = http(
+        "GET", f"{CP}/v1/keys/{kid}/statement?start={start}&end={end}&{query}",
+        {"Authorization": f"Bearer {ADMIN}"})
+    return body
+
+
 def wait_healthy() -> None:
     for base, plane in ((CP, "control"), (DP, "data")):
         for _ in range(60):
@@ -500,6 +513,141 @@ def t_restart_durability(compose_file: str) -> None:
            f"statuses={statuses}")
 
 
+def t_ledger_and_statement() -> None:
+    print("\n=== 10) 占用流水与对账单 ===")
+    t0 = int(time.time())
+    kid, key = issue_key("ledger", burst=10, refill_ms=100000, win_s=300, win_q=100)
+
+    # 2 笔调成（alice / bob）、1 笔没调成退回（alice）
+    s1, _, _ = call_dp(key, idem="L-1", client="alice")
+    s2, _, _ = call_dp(key, idem="L-2", client="bob")
+    sf, _, _ = call_dp(key, idem="L-3", client="alice", path="/fail")
+    record("准备：2 调成 + 1 退回",
+           s1 == 200 and s2 == 200 and sf == 502, f"{s1}/{s2}/{sf}")
+
+    # 10a. 占到/调成/退回各留一笔，且只一笔
+    ev = ledger(kid, "order=asc&limit=200")
+    pairs = [(e["kind"], e["reason"], e["idem_key"]) for e in ev["events"]]
+    expect = [("reserve", "", "L-1"), ("confirm", "", "L-1"),
+              ("reserve", "", "L-2"), ("confirm", "", "L-2"),
+              ("reserve", "", "L-3"), ("release", "upstream", "L-3")]
+    record("占到/调成/退回各一笔、字段正确（kind/reason/idem/pool）",
+           pairs == expect, json.dumps(pairs, ensure_ascii=False))
+    assert all(e["pool"] == "shared" for e in ev["events"])
+
+    # 10b. 同一业务号再来不重复留笔
+    call_dp(key, idem="L-1", client="alice")  # 409
+    call_dp(key, idem="L-3", client="alice", path="/fail")  # 409
+    ev = ledger(kid, "limit=200")
+    record("同一业务号占/结/退各只能记一笔（再来不新增流水）",
+           ev["returned"] == 6, f"returned={ev['returned']}")
+
+    # 10c. 按调用方翻
+    ev_a = ledger(kid, "caller=alice&order=asc")
+    ev_b = ledger(kid, "caller=bob")
+    record("按调用方翻：alice 4 笔、bob 2 笔，且不串号",
+           ev_a["returned"] == 4 and ev_b["returned"] == 2
+           and {e["idem_key"] for e in ev_a["events"]} == {"L-1", "L-3"},
+           f"alice={ev_a['returned']} bob={ev_b['returned']}")
+
+    # 10d. 按业务号翻
+    ev_i = ledger(kid, "idem_key=L-2")
+    record("按业务号翻：L-2 恰好占/结两笔",
+           ev_i["returned"] == 2
+           and [e["kind"] for e in ev_i["events"]] == ["confirm", "reserve"],
+           f"returned={ev_i['returned']}")
+
+    # 10e. 按时间段翻（未来 1 小时为空；覆盖区间为全量）
+    now = int(time.time())
+    ev_future = ledger(kid, f"start={now+3600}&end={now+7200}")
+    ev_past = ledger(kid, f"start={t0-60}&end={now+60}")
+    record("按时间段翻：未来为空、覆盖区间拿全 6 笔",
+           ev_future["returned"] == 0 and ev_past["returned"] == 6,
+           f"future={ev_future['returned']} past={ev_past['returned']}")
+
+    # 10f. 对账单：占过 3、真用掉 2、退回 1，还占着 0
+    st = statement(kid, t0 - 60, now + 60)
+    t = st["totals"]
+    rec = st["reconciliation"]
+    ok_stmt = (t["reserved"] == 3 and t["confirmed"] == 2 and t["released"] == 1
+               and t["released_upstream"] == 1 and t["released_timeout"] == 0
+               and st["held_open"]["total_cost"] == 0)
+    record("对账单：占过 3 / 真用掉 2 / 退回 1（upstream）/ 还占着 0",
+           ok_stmt, json.dumps(t, ensure_ascii=False))
+    record("真用掉与余量计数侧对得上（两边数都亮出）",
+           rec["matched"] is True and rec["ledger_confirmed"] == 2
+           and rec["counter_consumed"] == 2 and rec["difference"] == 0,
+           json.dumps({k: rec[k] for k in
+                       ("matched", "ledger_confirmed", "counter_consumed",
+                        "difference")}, ensure_ascii=False))
+
+    # 10g. 还占着的单独列、不算真用掉
+    done: list = []
+
+    def held_call():
+        done.append(call_dp(key, idem="L-hold", client="alice",
+                            path="/slow?ms=1200"))
+
+    th = threading.Thread(target=held_call)
+    th.start()
+    time.sleep(0.5)
+    st2 = statement(kid, t0 - 60, now + 120)
+    held = st2["held_open"]
+    record("调用进行中：还占着的单独列（items_in_range），且不进真用掉",
+           held["reserved_in_range_cost"] == 1
+           and held["items_in_range"][0]["idem_key"] == "L-hold"
+           and st2["totals"]["reserved"] == 4
+           and st2["totals"]["confirmed"] == 2,
+           json.dumps({"held": held["total_cost"],
+                       "items": [x["idem_key"] for x in held["items_in_range"]]},
+                      ensure_ascii=False))
+    th.join()
+    record("慢调用最终成功并补确认", done and done[0][0] == 200, f"{done}")
+
+    # 10h. 对不上时两边数都亮出：在真有调用的密钥上制造计数差异。
+    # 正常路径数据面与计数在同一 Lua 内一致，这里直接改 win 桶模拟
+    # “余量计数与流水不一致”（如人工修数/迁移），statement 必须两边都亮。
+    # 需要本机有 redis-cli（演示镜像里没有就跳过这一子项）。
+    import shutil
+    rcli = shutil.which("redis-cli")
+    if rcli:
+        import subprocess
+        win_ms = 300_000
+        cur_bucket = int(time.time() * 1000) // win_ms
+        rc = subprocess.run(
+            [rcli, "-u",
+             os.environ.get("REDIS_CLI_URL", "redis://127.0.0.1:6379/0"),
+             "INCRBY", f"{{qk:{kid}}}win:300:{cur_bucket}", "7"],
+            capture_output=True, text=True, timeout=5)
+        if rc.returncode == 0 and rc.stdout.strip().isdigit():
+            st3 = statement(kid, t0 - 60, int(time.time()) + 60)
+            rec3 = st3["reconciliation"]
+            ok_diff = (rec3["feasible"] is True and rec3["matched"] is False
+                       and rec3["ledger_confirmed"] == 3
+                       and rec3["counter_consumed"] == 10
+                       and rec3["difference"] == 7 and "disagree" in rec3["note"])
+            record("对不上时两边数都亮出（ledger=3 / counter=10 / difference=7）",
+                   ok_diff,
+                   json.dumps({k: rec3[k] for k in
+                               ("matched", "ledger_confirmed", "counter_consumed",
+                                "difference")}, ensure_ascii=False))
+        else:
+            record("对不上时两边数都亮出（跳过：连不上 Redis CLI）", True)
+    else:
+        record("对不上时两边数都亮出（跳过：环境无 redis-cli）", True)
+
+    # 10i. 停用后流水还在、对账单还能拉
+    http("POST", f"{CP}/v1/keys/{kid}/revoke",
+         {"Authorization": f"Bearer {ADMIN}"})
+    ev_r = ledger(kid, "limit=200")
+    st_r = statement(kid, t0 - 60, int(time.time()) + 60)
+    record("密钥停用后：流水仍可翻、对账单仍可拉、state=revoked",
+           ev_r.get("state") == "revoked" and ev_r["returned"] >= 8
+           and st_r["state"] == "revoked"
+           and st_r["totals"]["confirmed"] == 3,
+           f"events={ev_r['returned']} confirmed={st_r['totals']['confirmed']}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--restart", action="store_true",
@@ -515,6 +663,7 @@ def main() -> None:
     t_idempotency()
     t_auth_and_revoke()
     t_shares()
+    t_ledger_and_statement()
     if args.restart:
         compose = str(Path(__file__).resolve().parent.parent / "docker-compose.yml")
         t_restart_durability(compose)

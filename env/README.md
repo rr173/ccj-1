@@ -27,6 +27,10 @@
 | Redis 重启后无需重启两端 | 两端对 `NOSCRIPT`（按异常类型识别并重新 `SCRIPT LOAD` 刷新 SHA）、连接拒绝、`LOADING/READONLY` 做自动重载+退避重试；Redis 恢复后下一次请求即自愈。宕机窗口返回明确 **503 + Retry-After**，不是裸 500；数据面连不上 Redis 启动时进入降级态而不是退出 |
 | 停用后仍可查余量 | 停用密钥的余量查询返回 200、`state=revoked`：可再占显示 0，但**还占着 / 真用掉保持真实**（不抹账），配置口径照常返回 |
 | 两边对不上时以已对外发生的扣减为准 | **数据面只写计数，控制面只写配置**。控制面查余量时实时读计数；控制面从不回写/重置计数，历史扣减永远是事实来源 |
+| 占用流水（占到/调成/退回各一笔，留了不能改） | 每把密钥一条只追加 Stream `{qk:id}ledger`，在 reserve/settle/sweep 的 Lua 内与计数变更**同一原子动作** XADD；只 XADD，从不 XDEL/XTRIM/改写；按调用方 `lci:`、按业务号 `lii:` 各挂 ZSET 索引。`GET /v1/keys/{kid}/ledger` 按密钥 + 调用方/业务号/时间段翻 |
+| 同一业务号占、结、退各只能记一笔 | 幂等由占用单状态机保证（`""→confirmed/released/expired`）：已终结的单子再来只回原结论、不产生第二笔；超时退回的单子迟到真回音可补一笔 `confirm(late=1)`，退回流水仍只有 timeout 那笔 |
+| 对账单：占过/真用掉/退回/还占着 | `GET /v1/keys/{kid}/statement?start=&end=`：区间内 reserve/confirm/release 累计、`held_open` 还占着的单独列（不算真用掉），并把**流水侧真用掉与余量 win 计数侧真用掉**对账，对不上时 `ledger_confirmed`、`counter_consumed`、`difference` 两边数都亮出 |
+| 密钥停了流水还在、对账单还能拉 | revoke 只改 cfg.revoked，不碰 Stream/索引；ledger/statement 对 revoked 密钥照常返回；重启后流水随 AOF(appendfsync always) 落盘不丢，两端无需重启自动自愈 |
 | Docker 部署 | `docker compose up -d --build`，含 Redis（持久化卷）、控制面、数据面、模拟上游 |
 
 ## 架构
@@ -163,8 +167,9 @@ X-Retry-After-Ms: 400
 `missing_api_key`（401）、`quota_store_unavailable`（503，记额度层
 重启/不可用，带 `Retry-After: 2`，Redis 恢复后自动自愈、无需重启两端）、
 `upstream_unavailable`（502，这次没调成，**占着的额度已退回**）、
-`idempotent_replay_confirmed` / `idempotent_replay_released`（409，
-同一业务号重放，见下节）。
+`idempotent_replay_confirmed` / `idempotent_replay_released` /
+`idempotent_replay_timeout`（409，同一业务号重放：已确认 / 已退回 /
+约定时限过了没回音已按超时退回，后两者都要换新业务号再试；见下节）。
 
 > 停用后的密钥仍可查余量：`GET /v1/keys/{kid}/quota` 返回 200 且
 > `state="revoked"`，可再占显示 0，还占着/真用掉照实，配置口径照常返回。
@@ -182,6 +187,50 @@ X-Retry-After-Ms: 400
 - 占用还在约定回音时限内（上次可能调到一半数据面崩了）：重试直接带着
   同一张占用单调上游，调完照常了结，**同一笔业务只算一次**；
 - 占用单保留 24h（占用本身的额度效力只到约定回音时限，过期自动退回）。
+
+## 占用流水与对账单
+
+每笔占、调（确认）、退都在同一段 Lua 里与计数变更原子留一笔，落在该密钥
+专属的只追加 Stream `{qk:<kid>}ledger`（entry id 即 Redis 毫秒时间戳），
+另按调用方（`{qk}lci:<sha1(caller)>`）、业务号（`{qk}lii:<sha1(业务号)>`）
+各挂一个 ZSET 索引。**代码里只有 XADD，没有 XDEL/XTRIM/改写路径**——留下
+之后不能改；密钥停用、两端重启都不影响已落盘流水（AOF `appendfsync always`）。
+
+每笔流水字段：`kind`（reserve/confirm/release）、`caller`、`idem`、
+`pool`（shared/share）、`cost`、`reason`（release 时 upstream/timeout）、
+`late`（约定时限过后才赶到的迟到确认，为 1）、`res`（占用单号）。
+
+翻流水（控制面，管理员鉴权；时间参数给秒或毫秒都行，end 不含）：
+
+```bash
+# 按密钥（必选）翻全部
+curl -s "localhost:8000/v1/keys/<kid>/ledger?order=desc&limit=200" -H "Authorization: Bearer $ADMIN"
+# 叠加：按调用方 / 按业务号 / 按时间段
+curl -s "localhost:8000/v1/keys/<kid>/ledger?caller=alice" -H ...
+curl -s "localhost:8000/v1/keys/<kid>/ledger?idem_key=order-123" -H ...
+curl -s "localhost:8000/v1/keys/<kid>/ledger?start=1789000000&end=1789003600" -H ...
+```
+
+对账单（`GET /v1/keys/{kid}/statement?start=&end=`，可加 `caller=` 只出某
+调用方的账）：
+
+- `totals.reserved/confirmed/released`：这段**占过多少、真用掉多少、退回多少**
+  （`released_upstream`=没调成即时退，`released_timeout`=过约定时限没回音自动退）；
+- `held_open`：**还占着的单独列**（区间内占的 `items_in_range`、更早挂过来的
+  `items_carried` 分开），这些不计入真用掉；
+- `reconciliation`：流水侧真用掉（区间对齐到固定窗口桶后的 confirm 合计）与
+  余量侧真用掉（同一批 `win/swin` 计数，和 `GET /quota` 同口径）对照。
+  一致则 `matched=true`；**对不上 `matched=false` 且两边的数都亮出**：
+  `ledger_confirmed`、`counter_consumed`、`difference`，并在 `note` 给出原因
+  （迟到确认记进了后一个桶 / 区间超出计数桶 2 窗口 TTL / 未点名调用方不可
+  按 X-Client-Id 归因）。
+
+约定时限内没回音的占用有两条终结路径，都会留 `release/reason=timeout` 一笔：
+① 下一次同池占用时 reserve.lua 顺手清；② 数据面后台 sweep 任务
+（`SWEEP_INTERVAL_SECONDS`，默认 2s）扫所有 holds 登记兜底，冷池也不挂死。
+迟到的真实回音随后赶到，仍把单子推进为 confirmed 并补一笔 `confirm(late=1)`
+（宁可在占时保守、也不丢真实调用）；同一业务号在超时退回后再来返回 409
+`idempotent_replay_timeout`，换新业务号才能再试。
 
 ## 公平性的边界（如实说明）
 
@@ -224,21 +273,31 @@ X-Retry-After-Ms: 400
 8. **可观测**：建议数据面对 `burst_limited/window_limited/revoked/
    quota_store_unavailable/upstream_unavailable` 与占用超时退回打点上报
    Prometheus（本仓库为聚焦核心未包含）。
+9. **流水增长**：`ledger` Stream 与调用方/业务号索引只追加、不设 TTL、
+   不裁剪（“留下之后不能改”的硬要求）。长期运行需要在 Redis 之外做归档：
+   用 `XRANGE`/`XREAD` 增量消费（entry id 即毫秒时间戳，天然支持断点续传），
+   落到对象存储/数仓后再按合规期限决定是否离线保存；在线 Stream 的裁剪必须
+   走独立的、有审计的运维流程，应用本身不提供任何改写/删除入口。
 
 ## 目录
 
 ```
 common/               两端共享的协议（构建时各自打进镜像）
   reserve.lua         数据面：原子 去重→校验→选池(份额/公共)→清过期占用→
-                      令牌桶→滑动窗口→判定→登记占用（只登记、不真扣）
-  settle.lua          数据面：了结占用——confirm 真扣 / release 退回，幂等
+                      令牌桶→滑动窗口→判定→登记占用（只登记、不真扣），
+                      并 XADD 一笔 reserve 流水；顺手终结已过期占用（timeout 流水）
+  settle.lua          数据面：了结占用——confirm 真扣 / release 退回，幂等，
+                      confirm/release 各 XADD 一笔流水（迟到确认标 late=1）
+  sweep.lua           数据面后台兜底：把冷池里过期未回音的占用终结为超时退回
   quota.lua           控制面：只读余量查询（总盘+公共池+各份额，
                       每个视角都有 可再占/还占着/真用掉），口径与 reserve 一致
   set_share.lua       控制面：原子校验“Σ份额 ≤ 总量”并写入份额表
-  keys.py             key 规则、hash、配置字段
+  keys.py             key 规则、hash、配置字段（含 ledger Stream/索引规则）
   script_runner.py    NOSCRIPT 自动重载 + 连接/LOADING/READONLY 退避重试
-control_plane/        FastAPI：签发/停用/列表/查余量/设份额
-data_plane/          aiohttp 反向代理：per-key 轮转公平 + 占用→透传→了结
+control_plane/        FastAPI：签发/停用/列表/查余量/设份额/翻流水/拉对账单
+  ledger.py           占用流水查询（按密钥+调用方/业务号/时间段）与对账单聚合
+data_plane/          aiohttp 反向代理：per-key 轮转公平 + 占用→透传→了结，
+                      后台 sweep 任务兜底超时占用
   fairness.py         同一密钥内按调用方轮转的 FIFO 调度器
 mock_upstream/        被保护的真实服务示例（标准库；/fail 模拟故障、
                       /slow?ms=N 模拟慢上游，用于验证退回与超时）

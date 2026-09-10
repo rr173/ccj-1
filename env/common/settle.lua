@@ -63,6 +63,12 @@ local now_ms = t[1] * 1000 + math.floor(t[2] / 1000)
 local now_us = t[1] * 1000000 + t[2]
 
 local kid          = h.kid
+-- 滚动升级边界：老版本占下的在飞占用单没有 kid 字段，从占用单 key 反解
+-- （{qk:<kid>}res:...），保证升级前占的单子升级后仍能正常了结、留笔。
+if not kid or kid == "" then
+  local kp = string.match(res_key, "^{qk:([^}]+)}")
+  if kp then kid = kp end
+end
 local cost         = tonumber(h.cost or "1")
 local holds_key    = h.holds
 local wholds_key   = h.wholds
