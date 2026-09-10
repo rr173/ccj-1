@@ -12,31 +12,27 @@
 -- 幂等：占用单已了结（outcome 非空）时直接返回原结论，不重复结；
 -- 两种结局都返回 {1, outcome}，调用方按 outcome 区分。
 --
--- KEYS[1] = cfg    密钥配置 hash（确认前必须再查一次 revoked）
--- KEYS[2] = res    占用单 hash
--- KEYS[3] = passes 通行证配置 hash（持通行证的占用确认前必须再查一次有效性）
+-- KEYS[1] = cfg  配置 hash（确认前必须再查一次 revoked）
+-- KEYS[2] = res  占用单 hash
 --
 -- ARGV:
 --  1  action      "confirm" / "release"
 --  2  force       "1" 表示无视约定回音时限立即释放（没调成时的即时退款）；
 --                 "0" 表示仅在已过期（lease_exp_ms <= now）时允许释放
---  3  pid         通行证ID；空串表示密钥本体/份额的占用
+--                 （占用方失联，由别人来把占着的额度退回公共池）
 --
 -- 返回：
 --   {1, outcome, lease_expires_unix}   已了结：outcome = confirmed/released
 --   {0, "not_found"}                   占用单不存在（从未占用或已过期清理）
 --   {0, "revoked"}                     密钥已停用：不能确认（占用仍在，等退回）
---   {0, "pass_expired"}                通行证已到点/被吊销：不能确认
 --   {0, "not_expired", retry_after_ms} 未到约定回音时限，不能按过期释放
 --   {0, "bad_action"}                  非法动作
 
-local cfg_key    = KEYS[1]
-local res_key    = KEYS[2]
-local passes_key = KEYS[3]
+local cfg_key = KEYS[1]
+local res_key = KEYS[2]
 
 local action = ARGV[1]
 local force  = ARGV[2] == "1"
-local pid    = ARGV[3] or ""
 
 if action ~= "confirm" and action ~= "release" then
   return {0, "bad_action"}
@@ -76,19 +72,6 @@ if action == "confirm" then
   end
   if redis.call("HGET", cfg_key, "revoked") == "1" then
     return {0, "revoked"}
-  end
-  -- 通行证到点/被吊销以后，已经占着的也不能再当成调成
-  local res_pid = h.pid or pid
-  if res_pid and res_pid ~= "" then
-    local praw = redis.call("HGET", passes_key, res_pid)
-    if not praw then
-      return {0, "pass_expired"}
-    end
-    local pok, ps = pcall(cjson.decode, praw)
-    if not pok or type(ps) ~= "table"
-       or ps["r"] == "1" or (tonumber(ps["e"]) or 0) <= now_ms then
-      return {0, "pass_expired"}
-    end
   end
 
   -- 占用登记作废（若已随回音时限过期被清掉，ZREM 为空操作，无副作用）
@@ -162,11 +145,6 @@ end
 if wholds_key and wholds_key ~= "" then
   redis.call("ZREM", wholds_key, unpack(members))
 end
--- 作废通行证的占用可能已被 reserve.lua 并入公共池占用集合（替密钥挡额度）；
--- 同步删掉公共池里的副本，让退回立即生效，不必等回音时限记分自然过期。
--- 对密钥本体/份额占用这是空操作（成员名带着自己的占用单号，本来就不存在）。
-redis.call("ZREM", "{qk:" .. (h.kid or "") .. "}holds", unpack(members))
-redis.call("ZREM", "{qk:" .. (h.kid or "") .. "}wholds", unpack(members))
 
 redis.call("HSET", res_key, "outcome", "released")
 return {1, "released", tonumber(h.lease_exp or 0)}
