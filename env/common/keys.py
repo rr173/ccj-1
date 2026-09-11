@@ -146,3 +146,35 @@ def pool_reservation_key(pid: str, kid: str, idempotency_key: str = "") -> str:
 def pool_win_prefix(pid: str) -> str:
     return f"{{qp:{pid}}}win:"
 
+
+# ── 主备顶上（有效密钥的 1:1 备钥）─────────────────────────────────────────
+# 绑定是配置，由控制面 failover_member.lua 原子写入；数据面只读。
+# 所有主备状态键都挂在【主钥】的 hash tag 下，主钥自身的判定脚本同 slot
+# 即可读写；顶上发生在备钥 tag 上的那一次 reserve 会跨 tag 写主钥统计/路由
+# （与共享池同一取舍：单机/主从 Redis 支持，Cluster 需外部协调）。
+def failover_backup_key(kid: str) -> str:
+    """主钥 → 当前绑定备钥 kid：string；不存在即没绑。解绑即 DEL。"""
+    return f"{{qk:{kid}}}fbb"
+
+
+def failover_master_key(bkid: str) -> str:
+    """备钥 → 主钥 kid 的反向索引：string；与 fbb 同生共死，保证
+    “一把备钥不能同时给好几把主钥顶”。"""
+    return f"{{qk:{bkid}}}fbm"
+
+
+def failover_stats_key(kid: str) -> str:
+    """主钥视角的主备运行统计 hash（挂主钥 tag）：
+       streak  主钥连着占不住的次数（主钥新占成一次即清零）
+       active  此刻还占在备钥上、没了结的单数（备钥在顶的在飞量）
+       used    备钥替主钥真用掉（已确认）的累计
+    """
+    return f"{{qk:{kid}}}fbsv"
+
+
+def failover_route_key(kid: str, idempotency_key: str) -> str:
+    """业务号 → 这笔业务第一次占到的实际密钥 kid（主或备）。
+    同一业务号再来按路由走第一次那把，绝不换到另一把再占一次。"""
+    h = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    return f"{{qk:{kid}}}fbrt:{h}"
+

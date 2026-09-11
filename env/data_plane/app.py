@@ -128,13 +128,19 @@ async def close_redis(app: web.Application) -> None:
 
 def _error(status: int, code: str, retry_after_ms: int | None = None,
            remaining_burst: int | None = None, remaining_window: int | None = None,
-           detail: str | None = None) -> web.Response:
+           detail: str | None = None, served_by: str | None = None,
+           requested_key: str | None = None) -> web.Response:
     body = {
         "error": {
             "code": code,
             "message": detail or code,
         }
     }
+    if served_by is not None and requested_key is not None and served_by != requested_key:
+        # 主钥占不住、这笔此刻是备钥在顶（备钥也满了的 429 同样标出）
+        body["error"]["failover"] = True
+        body["error"]["served_by"] = "backup"
+        body["served_key_id"] = served_by
     if retry_after_ms is not None:
         body["error"]["retry_after_ms"] = retry_after_ms
         body["error"]["retry_after"] = max(1, round(retry_after_ms / 1000))
@@ -154,11 +160,18 @@ class StoreUnavailableError(Exception):
     """记额度那层不可用（连接不上 / 重启中 / 只读故障切换）。"""
 
 
-async def reserve(kid: str, idem: str, client: str, res_key: str,
-                  pid: str = "", pool_res_key: str = "") -> list:
-    """先占密钥自己的额度；若密钥在共享池里，再由 pool_reserve 占池额度。"""
+async def reserve_one(effective_kid: str, idem: str, client: str, res_key: str,
+                      pid: str = "", pool_res_key: str = "",
+                      fb_role: str = "", fb_master_kid: str = "",
+                      fb_route_key: str = "", fb_stats_key: str = "") -> list:
+    """在一把指定的密钥上完成“密钥自身 + 可选共享池”的占用。
+
+    对调用方来说进来的永远是主钥（X-Api-Key），但主备顶上时真正占到的
+    可能是备钥——所有后续了结/记账都以实际占到的 effective_kid 为准。
+    fb_role/fb_master_kid/fb_route_key/fb_stats_key 是主备顶上才有的参数。
+    """
     try:
-        cfg = await redis_client.hgetall(keys.cfg_key(kid))
+        cfg = await redis_client.hgetall(keys.cfg_key(effective_kid))
     except (aioredis.ConnectionError, aioredis.TimeoutError,
             aioredis.BusyLoadingError) as exc:
         raise StoreUnavailableError() from exc
@@ -166,15 +179,15 @@ async def reserve(kid: str, idem: str, client: str, res_key: str,
         return [3, "key not found"]
 
     try:
-        current_pid = await redis_client.get(keys.pool_membership_key(kid))
+        current_pid = await redis_client.get(keys.pool_membership_key(effective_kid))
     except (aioredis.ConnectionError, aioredis.TimeoutError,
             aioredis.BusyLoadingError) as exc:
         raise StoreUnavailableError() from exc
     current_pid = current_pid or pid
-    paired_pool_res = keys.pool_reservation_key(current_pid, kid, idem) if current_pid else ""
+    paired_pool_res = keys.pool_reservation_key(current_pid, effective_kid, idem) if current_pid else ""
 
     args = [
-        kid,
+        effective_kid,
         cfg[keys.F_CAPACITY],
         cfg[keys.F_REFILL_MS],
         cfg[keys.F_WINDOW_SECONDS],
@@ -185,12 +198,20 @@ async def reserve(kid: str, idem: str, client: str, res_key: str,
         client,
         current_pid,
         paired_pool_res,
+        fb_role,
+        fb_master_kid,
+        fb_route_key,
+        fb_stats_key,
     ]
-    lua_keys = [keys.cfg_key(kid), keys.tb_key(kid), keys.shares_key(kid),
-                res_key, keys.ledger_stream_key(kid)]
+    num_keys = 6 if fb_route_key else 5
+    lua_keys = [keys.cfg_key(effective_kid), keys.tb_key(effective_kid),
+                keys.shares_key(effective_kid), res_key,
+                keys.ledger_stream_key(effective_kid)]
+    if fb_route_key:
+        lua_keys.append(fb_route_key)
     try:
         key_result = await run_script_async(
-            redis_client, _RESERVE_SRC, _reserve_sha, 5,
+            redis_client, _RESERVE_SRC, _reserve_sha, num_keys,
             [*lua_keys, *args])
     except (aioredis.ConnectionError, aioredis.TimeoutError,
             aioredis.BusyLoadingError) as exc:
@@ -218,18 +239,18 @@ async def reserve(kid: str, idem: str, client: str, res_key: str,
         raise StoreUnavailableError() from exc
     if not pcfg:
         # 归属指向了不存在/已删除的池：保守拒绝新占并释放刚占的密钥侧。
-        await settle(kid, res_key, "release", force=True)
+        await settle(effective_kid, res_key, "release", force=True)
         return [0, "pool_stopped", 0, 0, 0]
 
     pool_keys = [
         keys.pool_cfg_key(current_pid),
         keys.pool_tb_key(current_pid),
         keys.pool_members_key(current_pid),
-        keys.pool_membership_key(kid),
+        keys.pool_membership_key(effective_kid),
         pool_res_key,
     ]
     pool_args = [
-        current_pid, kid,
+        current_pid, effective_kid,
         pcfg[keys.F_CAPACITY], pcfg[keys.F_REFILL_MS],
         pcfg[keys.F_WINDOW_SECONDS], pcfg[keys.F_WINDOW_QUOTA],
         1, idem, RESERVATION_TTL_SECONDS, client, res_key,
@@ -250,15 +271,86 @@ async def reserve(kid: str, idem: str, client: str, res_key: str,
         return [2, key_result[1], "", pool_result[3], pool_result[4], pool_res_key]
     if pc == 0 and pool_result[1] in {"burst_limited", "window_limited"}:
         # 密钥自己还有但池满：立即释放刚占的密钥侧；响应只报池还需等多久。
-        await settle(kid, res_key, "release", force=True)
+        await settle(effective_kid, res_key, "release", force=True)
         return pool_result
     if pc == 0 and pool_result[1] == "pool_stopped":
-        await settle(kid, res_key, "release", force=True)
+        await settle(effective_kid, res_key, "release", force=True)
         return pool_result
     if pc == 3 and pool_result[1] == "not pool member":
         # 并发移出池：这次请求不再受池限制，沿用密钥侧已占住的额度。
         return key_result
     return pool_result
+
+
+async def reserve_with_failover(kid: str, idem: str, client: str,
+                                res_key: str) -> tuple[str, str, list]:
+    """主备顶上的占用编排，返回 (实际占到的密钥 kid, 实际占用单 key, 结果)。
+
+    顺序是硬的：
+      1. 同一业务号带路由再来：永远走第一次占到的那把（路由只在顶上占成时
+         原子写下），不看当前绑定是否已解绑/换绑；
+      2. 平时只占主钥；
+      3. 主钥【额度】这一笔占不住（突发/窗口满）且绑着有效的备钥，同一笔
+         立刻改占备钥——主钥那次 reserve 没占成、什么都没咬住，不存在两头
+         同时被占；
+      4. 备钥也满了，直接把备钥给出的“还要等多久”告诉调用方；
+      5. 主钥又能占住以后，新来的自然回到主钥（主钥路径新占成即 streak=0）。
+    主钥停用（key_revoked）、备钥停用/解绑、管理性失败都不触发顶上。
+    """
+    # 1) 业务号路由：同一笔永远回到第一次占到的那把
+    if idem:
+        try:
+            routed = await redis_client.get(keys.failover_route_key(kid, idem))
+        except (aioredis.ConnectionError, aioredis.TimeoutError,
+                aioredis.BusyLoadingError) as exc:
+            raise StoreUnavailableError() from exc
+        if routed:
+            route_res_key = keys.reservation_key(routed, idem)
+            return routed, route_res_key, await reserve_one(
+                routed, idem, client, route_res_key)
+
+    # 2) 先只占主钥。没绑备钥时 fb_role 为空，行为与旧版完全一致。
+    try:
+        bkid = await redis_client.get(keys.failover_backup_key(kid))
+    except (aioredis.ConnectionError, aioredis.TimeoutError,
+            aioredis.BusyLoadingError) as exc:
+        raise StoreUnavailableError() from exc
+
+    role = "master" if bkid else ""
+    stats_key = keys.failover_stats_key(kid) if bkid else ""
+    result = await reserve_one(kid, idem, client, res_key,
+                               fb_role=role, fb_stats_key=stats_key)
+
+    # 3) 只有“这一笔”在主钥额度上占不住才顶上；停用/池停/已了结都不顶
+    if int(result[0]) != 0 or result[1] not in {"burst_limited", "window_limited"} \
+       or not bkid:
+        return kid, res_key, result
+
+    # 顶上前再认一次绑定：解绑与这一笔并发时，以 Redis 里此刻的关系为准，
+    # 新来的不能去占已经解绑的备钥。
+    try:
+        bound_now = await redis_client.get(keys.failover_backup_key(kid))
+        backup_revoked = await redis_client.hget(keys.cfg_key(bkid), keys.F_REVOKED)
+        backup_exists = await redis_client.exists(keys.cfg_key(bkid))
+    except (aioredis.ConnectionError, aioredis.TimeoutError,
+            aioredis.BusyLoadingError) as exc:
+        raise StoreUnavailableError() from exc
+    if bound_now != bkid or not backup_exists or backup_revoked == "1":
+        # 备钥已经不是这把主钥的备钥：老老实回报主钥的占不住，不顶上
+        return kid, res_key, result
+
+    # 4) 同一笔立刻改占备钥（主钥那边没占成，没有需要释放的登记）。
+    #    占用单必须以【实际那把密钥】命名：备钥的 holds ZSET、流水与占用单
+    #    同 slot，跨 tag 的 member 在超时清理/了结时根本定位不到单子。
+    #    业务号相同的幂等性由 (kid, 业务号) 语义 + 主钥侧路由键保证。
+    bres_key = keys.reservation_key(bkid, idem) if idem else keys.reservation_key(bkid)
+    route_key = keys.failover_route_key(kid, idem) if idem else ""
+    bresult = await reserve_one(
+        bkid, idem, client, bres_key,
+        fb_role="backup", fb_master_kid=kid,
+        fb_route_key=route_key, fb_stats_key=keys.failover_stats_key(kid))
+    # 顶上占成 / 在飞重放 / 备钥也满（报备钥的等待）——都以备钥结果为准
+    return bkid, bres_key, bresult
 
 
 async def settle(kid: str, res_key: str, action: str, force: bool) -> list | None:
@@ -334,23 +426,23 @@ async def handle_proxy(request: web.Request) -> web.Response:
     idem = request.headers.get("Idempotency-Key", "")
     kid = keys.key_id(api_key)
     # 占用单号：带业务号（Idempotency-Key）时由业务号决定——同一业务号再来，
-    # 命中同一张占用单，绝不二次占额；匿名调用每次一张新单子
+    # 命中同一张占用单，绝不二次占额；匿名调用每次一张新单子。
+    # 主备顶上时实际占到的可能是备钥，占用单以“实际那把”的 kid 命名。
     res_key = keys.reservation_key(kid, idem) if idem else keys.reservation_key(kid)
-    # 共享池占用单先按 (kid,业务号) 预生成；reserve() 读取当前归属后可覆盖 pid。
-    pool_res_key = ""
     # 调用方身份：用于同一把密钥内多个租户之间的轮转公平与份额隔离
     client = request.headers.get("X-Client-Id") or (
         request.remote.split(":")[0] if request.remote else "anon")
 
     # 同密钥、按调用方轮转：先到先占，但每个请求只占自己的 1 个额度，
     # 任何调用方都不能成批抢光；最终额度由 Redis Lua 原子仲裁，绝不超发。
-    # 份额隔离同样在 Lua 内完成：client 命中 shares 表时只占自己的预留池。
+    # 顶上备钥的请求仍排在主钥的队里（对外只有一把主钥），不在备钥侧另开队列。
     queue = registry.get(kid)
     if queue is not None:
         await queue.acquire(client)
     try:
         try:
-            result = await reserve(kid, idem, client, res_key, pool_res_key=pool_res_key)
+            served_kid, served_res_key, result = await reserve_with_failover(
+                kid, idem, client, res_key)
         except StoreUnavailableError:
             # 记额度层重启/不可用：明确告知稍后重试，绝不“放行”也不裸 500
             return _error(503, "quota_store_unavailable", retry_after_ms=2000,
@@ -361,6 +453,7 @@ async def handle_proxy(request: web.Request) -> web.Response:
             registry.cleanup(kid, queue)
 
     code = int(result[0])
+    on_backup = served_kid != kid
 
     if code == 3:
         return _error(401, "invalid_api_key", detail=str(result[1]))
@@ -390,8 +483,8 @@ async def handle_proxy(request: web.Request) -> web.Response:
         # 调用方在重试）。直接带着这张占用单调上游，调完照常了结——
         # 同一笔业务只算一次。（若占用已超时限，reserve.lua 会终结旧占用、
         # 返回 timeout，走不到这里。）
-        return await forward_and_settle(request, kid, res_key,
-                                        rem_burst, rem_window)
+        return await forward_and_settle(request, served_kid, kid, served_res_key,
+                                        rem_burst, rem_window, on_backup)
 
     if code == 0:
         _, reason, retry_ms, rem_burst, rem_window = result
@@ -400,19 +493,27 @@ async def handle_proxy(request: web.Request) -> web.Response:
         if reason == "pool_stopped":
             return _error(403, "pool_stopped",
                           detail="quota pool is stopped; it cannot accept new reservations")
+        # 备钥也满了：等待时间以备钥这次判定为准（“备钥也满了才告诉还要等多久”）
         return _error(429, reason, retry_after_ms=int(retry_ms),
                       remaining_burst=int(rem_burst),
-                      remaining_window=int(rem_window))
+                      remaining_window=int(rem_window),
+                      detail=None, served_by=(served_kid if on_backup else None),
+                      requested_key=kid)
 
     # code == 1，占成功：放行调上游，调完按结果了结
     _, rem_burst, rem_window, _lease_exp = result[:4]
-    return await forward_and_settle(request, kid, res_key,
-                                    int(rem_burst), int(rem_window))
+    return await forward_and_settle(request, served_kid, kid, served_res_key,
+                                    int(rem_burst), int(rem_window), on_backup)
 
 
-async def forward_and_settle(request: web.Request, kid: str, res_key: str,
-                             rem_burst: int, rem_window: int) -> web.Response:
-    """带着占用单调上游，并按上游结果了结：成了确认，没成退回。"""
+async def forward_and_settle(request: web.Request, served_kid: str, kid: str,
+                             res_key: str, rem_burst: int, rem_window: int,
+                             on_backup: bool) -> web.Response:
+    """带着占用单调上游，并按上游结果了结：成了确认，没成退回。
+
+    served_kid 是这笔实际占到的密钥（主或备）；确认/退回都记在它的计数与
+    流水上，备钥顶上的单子由 settle.lua 同步回写主钥视角的主备统计。
+    """
     body = await request.read()
     fwd_headers = {
         k: v for k, v in request.headers.items()
@@ -421,13 +522,19 @@ async def forward_and_settle(request: web.Request, kid: str, res_key: str,
     }
     url = UPSTREAM_URL.rstrip("/") + request.path_qs
     session = request.app["upstream"]
+    # 备钥在顶的标记：成功响应头始终带出，调用方/排障一眼看得出这笔走的是备钥
+    served_headers = {
+        "X-Quota-Served-By": "backup" if on_backup else "primary",
+    }
+    if on_backup:
+        served_headers["X-Failover"] = "1"
     try:
         async with session.request(request.method, url, headers=fwd_headers,
                                    data=body, allow_redirects=False) as up:
             payload = await up.read()
             if up.status < 500:
                 # 上游给了业务应答（含 4xx：调用方自己的问题，额度照算）→ 确认
-                settled = await settle(kid, res_key, "confirm", force=False)
+                settled = await settle(served_kid, res_key, "confirm", force=False)
                 if settled and str(settled[0]) == "0" and settled[1] == "pool_stopped":
                     return _error(403, "pool_stopped",
                                   remaining_burst=rem_burst,
@@ -439,22 +546,27 @@ async def forward_and_settle(request: web.Request, kid: str, res_key: str,
                 }
                 resp_headers["X-Quota-Remaining-Burst"] = str(rem_burst)
                 resp_headers["X-Quota-Remaining-Window"] = str(rem_window)
+                resp_headers.update(served_headers)
                 return web.Response(status=up.status, body=payload,
                                     headers=resp_headers)
             # 上游 5xx：这次没调成，占着的额度退回去
-            await settle(kid, res_key, "release", force=True)
+            await settle(served_kid, res_key, "release", force=True)
             return _error(502, "upstream_unavailable",
                           remaining_burst=rem_burst, remaining_window=rem_window,
-                          detail=f"upstream returned {up.status}; reservation was released")
+                          detail=f"upstream returned {up.status}; reservation was released",
+                          served_by=(served_kid if on_backup else None),
+                          requested_key=kid)
     except aiohttp.ClientError as exc:
         # 上游连不上：没调成，占着的额度退回去，别人立刻能再占
-        await settle(kid, res_key, "release", force=True)
+        await settle(served_kid, res_key, "release", force=True)
         return _error(502, "upstream_unavailable",
                       remaining_burst=rem_burst, remaining_window=rem_window,
-                      detail=f"upstream call failed: {exc}; reservation was released")
+                      detail=f"upstream call failed: {exc}; reservation was released",
+                      served_by=(served_kid if on_backup else None),
+                      requested_key=kid)
     except (asyncio.CancelledError, ConnectionResetError):
         # 调用方中途断连：这笔不算调成，退回额度，让断连不白扣
-        await settle(kid, res_key, "release", force=True)
+        await settle(served_kid, res_key, "release", force=True)
         raise
 
 

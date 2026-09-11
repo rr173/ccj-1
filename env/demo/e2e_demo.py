@@ -875,7 +875,7 @@ def t_quota_pool() -> None:
     sa, _, ba = pool_add(pid, ka)
     sb2, _, bb = pool_add(pid, kb)
     record("放入两把密钥都点名 key_id，成员数正确",
-           sa == 200 and sb2 == 200 and ba["member_count"] == 2
+           sa == 200 and sb2 == 200 and ba["member_count"] == 1
            and bb["member_count"] == 2, f"{ba} {bb}")
 
     s1, _, _ = call_dp(key_a, idem="P-A1")

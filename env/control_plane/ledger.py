@@ -69,6 +69,15 @@ def _parse_event(eid: str, fields: dict, kid: str) -> dict:
         # 冲正专有：被冲那笔当时真用掉的量、管理员备注
         out["of_cost"] = int(fields.get("of", "0") or "0")
         out["note"] = fields.get("note", "")
+    fb_for = fields.get("fb_for", "")
+    if fb_for:
+        # 这笔是顶上备钥替该主钥发生的（在备钥自己的流水里能看到主钥是谁）
+        out["failover_for_key_id"] = fb_for
+    if fields.get("fbmirror") == "1":
+        # 主钥账本里的“顶上镜像”：计数实际在 fb_key 那把备钥上，镜像只是让
+        # 主钥视角的流水/对账能看到备钥替它顶过的每一笔（不参与本钥 win 对账）
+        out["failover_mirror"] = True
+        out["served_by_key_id"] = fields.get("fb_key", "")
     return out
 
 
@@ -337,11 +346,15 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         if u is None:
             u = {"cost": 1, "pool": "shared", "caller": "",
                  "reserved_at": 0, "confirmed": False, "late": False,
-                 "released": False, "reasons": set(), "in_range": False}
+                 "released": False, "reasons": set(), "in_range": False,
+                 "mirror": False}
             units[rid] = u
         u["cost"] = int(fields.get("cost", "1") or "1")
         u["pool"] = fields.get("pool") or u["pool"]
         u["caller"] = fields.get("caller", "")
+        if fields.get("fbmirror") == "1":
+            # 顶上镜像：计数实际在备钥，不参与本钥 win 桶对账
+            u["mirror"] = True
         kind = fields.get("kind", "")
         if kind == "reserve":
             u["reserved_at"] = int(fields.get("reserve_at", "0") or "0")
@@ -363,7 +376,8 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
             continue
         rid = f.get("res", "")
         if f.get("kind") == "reversal":
-            rev_in_range.append({"eid": eid, "f": f})
+            rev_in_range.append({"eid": eid, "f": f,
+                                 "mirror": f.get("fbmirror") == "1"})
             continue
         ingest(rid, f)
         if f.get("kind") == "reserve":
@@ -408,9 +422,13 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         u = units.get(rid)
         item["confirmed_in_range"] = bool(u and u["in_range"] and u["confirmed"])
 
-    rev_total = sum(int(i["f"].get("cost", "1") or "1") for i in rev_in_range)
+    # 顶上镜像 reversal（实际计数在备钥）与本钥原生 reversal 分开归集
+    rev_mirror = sum(
+        int(i["f"].get("cost", "1") or "1") for i in rev_in_range if i["mirror"])
+    rev_native = [i for i in rev_in_range if not i["mirror"]]
+    rev_total = sum(int(i["f"].get("cost", "1") or "1") for i in rev_native)
     rev_in_range_confirmed = sum(
-        int(i["f"].get("cost", "1") or "1") for i in rev_in_range
+        int(i["f"].get("cost", "1") or "1") for i in rev_native
         if i["confirmed_in_range"])
     rev_carried = rev_total - rev_in_range_confirmed
 
@@ -426,6 +444,14 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         "released_upstream": 0,
         "released_timeout": 0,
         "held_pending": 0,      # 还占着没回音的（区间内占、拉账单时仍未结局）
+        # 主备顶上：下面四项是“备钥替主钥”的镜像口径（计数实际在备钥），
+        # 独立列出，绝不并进本钥自己的 win 桶对账
+        "failover_confirmed_gross": 0,
+        "failover_confirmed": 0,
+        "failover_reversed": 0,
+        "failover_released": 0,
+        "failover_reserved": 0,
+        "failover_held_pending": 0,
     }
     by_pool: dict[str, dict] = {}
 
@@ -437,8 +463,20 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
     for rid, u in units.items():
         if not u["in_range"]:
             continue
-        b = pool_bucket(u["pool"])
         c = u["cost"]
+        if u["mirror"]:
+            # 顶上镜像单：只进“备钥替主钥”的单列，不进本钥自身的各池合计
+            totals["failover_reserved"] += c
+            if u["confirmed"]:
+                totals["failover_confirmed_gross"] += c
+                if u["late"]:
+                    totals["confirmed_late"] += c
+            elif u["released"]:
+                totals["failover_released"] += c
+            else:
+                totals["failover_held_pending"] += c
+            continue
+        b = pool_bucket(u["pool"])
         totals["reserved"] += c
         b["reserved"] += c
         if u["confirmed"]:
@@ -461,6 +499,11 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
             totals["held_pending"] += c
             b["held"] += c
 
+    # 镜像 reversal 只减“备钥顶上”的单列，不动本钥自身净额
+    totals["failover_reversed"] = rev_mirror
+    totals["failover_confirmed"] = (
+        totals["failover_confirmed_gross"] - rev_mirror)
+
     totals["confirmed"] = totals["confirmed_gross"] - rev_in_range_confirmed
 
     # 池维度：冲正按发生段计 reversed；池净额只减“本池本区间调成且本区间冲回”
@@ -468,7 +511,7 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         b = by_pool[pool]
         pool_rev = 0
         pool_rev_in_confirmed = 0
-        for item in rev_in_range:
+        for item in rev_native:
             if (item["f"].get("pool") or "shared") != pool:
                 continue
             cc = int(item["f"].get("cost", "1") or "1")
@@ -492,7 +535,7 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
     for item in sorted(rev_in_range, key=lambda x: x["eid"]):
         f = item["f"]
         conf = item["confirm"]
-        reversals_out.append({
+        entry = {
             "id": item["eid"],
             "ts_ms": _eid_ms(item["eid"]),
             "idem_key": f.get("idem", ""),
@@ -504,7 +547,12 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
                 else int(f.get("of", "0") or "0")),
             "confirmed_in_range": item["confirmed_in_range"],
             "note": f.get("note", ""),
-        })
+        }
+        if item["mirror"]:
+            # 顶上备钥的冲正镜像：计数实际退在备钥（fb_key），主钥只留可见事实
+            entry["failover_mirror"] = True
+            entry["served_by_key_id"] = f.get("fb_key", "")
+        reversals_out.append(entry)
 
     # ── 真用掉对账：流水侧净额 vs 余量侧 win/swin 固定桶计数 ──
     # 两边都按冲正后净额：流水侧把每笔冲正挂回它【原确认落的那个桶】扣减；
@@ -542,6 +590,9 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         for eid, f in _iter_stream(r, stream, aligned_start_ms, aligned_end_ms):
             if caller and f.get("caller", "") != caller:
                 continue
+            if f.get("fbmirror") == "1":
+                # 顶上镜像的计数在备钥 win 桶里，绝不并进本钥 win 对账
+                continue
             kind = f.get("kind", "")
             c = int(f.get("cost", "1") or "1")
             if kind == "confirm":
@@ -563,6 +614,8 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         late_aligned = 0
         for eid, f in _iter_stream(r, stream, aligned_start_ms, aligned_end_ms):
             if caller and f.get("caller", "") != caller:
+                continue
+            if f.get("fbmirror") == "1":
                 continue
             if f.get("kind") == "confirm" and f.get("late") == "1":
                 late_aligned += int(f.get("cost", "1") or "1")
@@ -639,9 +692,20 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         "range": {"start_ms": start_ms, "end_ms": end_ms},
         "filters": {"caller": caller or None},
         # 归并到的占用单笔数（一笔单可能对应多笔流水事件）
-        "reservations_matched": sum(1 for u in units.values() if u["in_range"]),
+        "reservations_matched": sum(
+            1 for u in units.values() if u["in_range"] and not u["mirror"]),
         "settle_lookahead_ms": SETTLE_LOOKAHEAD_MS,
         "totals": totals,
+        # 主备顶上：备钥替主钥发生的账（镜像口径，计数实际在备钥，单列不合入
+        # 本钥自身 win 对账）。净真用掉 = 顶上毛额 − 顶上冲正镜像
+        "failover": {
+            "reserved": totals["failover_reserved"],
+            "confirmed_gross": totals["failover_confirmed_gross"],
+            "confirmed": totals["failover_confirmed"],
+            "reversed": totals["failover_reversed"],
+            "released": totals["failover_released"],
+            "held_pending": totals["failover_held_pending"],
+        },
         "by_pool": by_pool,
         "reversals": reversals_out,
         "held_open": {

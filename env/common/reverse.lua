@@ -61,6 +61,15 @@ local kid    = ARGV[1]
 local idem   = ARGV[2]
 local amount = tonumber(ARGV[3])
 local note   = ARGV[4] or ""
+-- ARGV[5]（可选）：这笔冲正实际落在备钥 kid 上、但要镜像回该主钥的账本/统计。
+-- 主备顶上备钥确认的调用，管理员仍对主钥点名冲正，由控制面跨钥转发。
+local mirror_master = ARGV[5] or ""
+
+-- 非池密钥不进下面的池退款分支：先声明为本地变量，避免 XADD/返回表
+-- 引用到未声明全局（Redis 7 对未声明全局访问直接脚本报错）。
+local pool_pid = ""
+local pool_burst_refunded = 0
+local pool_window_refunded = 0
 
 if idem == "" then
   return {0, "idem_required"}
@@ -73,6 +82,11 @@ if redis.call("EXISTS", cfg_key) == 0 then
 end
 -- 密钥停了以后不能再冲（已经冲过的走 code=2 幂等分支，照样查得到）
 if redis.call("HGET", cfg_key, "revoked") == "1" then
+  return {0, "revoked"}
+end
+-- 跨钥冲正：主钥停了也拒绝新冲正（与“只能冲有效密钥”同一道门）
+if mirror_master ~= ""
+   and redis.call("HGET", "{qk:" .. mirror_master .. "}cfg", "revoked") == "1" then
   return {0, "revoked"}
 end
 
@@ -91,18 +105,21 @@ end
 -- 按业务号索引把这笔业务的全部事件翻出来（reserve/confirm/reversal 至多几笔）
 local lii_key = "{qk:" .. kid .. "}lii:" .. redis.sha1hex(idem)
 local eids = redis.call("ZRANGE", lii_key, 0, -1)
-local conf, resv, rev
+local conf, resv, rev, mirror_conf, mirror_rev
 for i = 1, #eids do
   local rows = redis.call("XRANGE", ledger_key, eids[i], eids[i])
   if rows[1] then
     local eid = rows[1][1]
     local f = to_map(rows[1][2])
     local kind = f["kind"] or ""
+    local is_mirror = f["fbmirror"] == "1"
     if kind == "confirm" then
-      conf = {eid = eid, f = f}
+      if is_mirror then mirror_conf = {eid = eid, f = f}
+      else conf = {eid = eid, f = f} end
     elseif kind == "reversal" then
-      rev = {eid = eid, f = f}
-    elseif kind == "reserve" then
+      if is_mirror then mirror_rev = {eid = eid, f = f}
+      else rev = {eid = eid, f = f} end
+    elseif kind == "reserve" and not is_mirror then
       resv = {eid = eid, f = f}
     end
   end
@@ -111,8 +128,9 @@ end
 local res_flat = redis.call("HGETALL", res_key)
 local rh = to_map(res_flat)
 
--- 一笔业务号只能冲一次：流水里已有 reversal，或占用单上留过冲正标记，
--- 再来只回原结论（不退回、不留第二笔）。
+-- 一笔业务号只能冲一次：以本钥【原生】reversal 或占用单冲正标记为准。
+-- 镜像（fbmirror=1）是顶上备钥那笔在主钥账本里的投影，绝不据此判定已冲，
+-- 否则主钥侧冲正会被自己账本里的镜像短路。
 if rev or (rh["rev_amount"] and rh["rev_amount"] ~= "") then
   local eid, amt, orig_cost
   if rev then
@@ -124,11 +142,39 @@ if rev or (rh["rev_amount"] and rh["rev_amount"] ~= "") then
     amt = tonumber(rh["rev_amount"]) or 0
     orig_cost = conf and tonumber(conf.f["cost"]) or amt
   end
-  return {2, eid, amt, orig_cost}
+  return {2, eid, amt, orig_cost, mirror_master ~= "" and mirror_master or ""}
 end
 
--- 只能冲已经调成的那一笔
+-- 只能冲已经调成的那一笔（以本钥原生 confirm 为准）
 if not conf then
+  -- 主钥账本里已有这笔业务的【镜像 reversal】：说明顶上备钥那笔已经冲过，
+  -- 幂等回原结论，不能再跨到备钥重复冲。
+  if mirror_rev then
+    -- 第 5 段回带备钥 kid（镜像上的 fb_key），控制面据此标明这笔实际冲在备钥
+    return {2, mirror_rev.eid,
+            tonumber(mirror_rev.f["cost"]) or 0,
+            tonumber(mirror_rev.f["of"]) or 0,
+            mirror_rev.f["fb_key"] or ""}
+  end
+  -- 主备顶上：这笔业务可能实际占到了绑定的备钥。返回 not_here 让控制面
+  -- 跨到备钥账本确认并冲正（主钥 lii 里只有镜像、没有原生 confirm）。
+  local bkid_v = redis.call("GET", "{qk:" .. kid .. "}fbb") or ""
+  if bkid_v ~= "" then
+    local blii = "{qk:" .. bkid_v .. "}lii:" .. redis.sha1hex(idem)
+    local beids = redis.call("ZRANGE", blii, 0, -1)
+    for i = 1, #beids do
+      local brows = redis.call(
+        "XRANGE", "{qk:" .. bkid_v .. "}ledger", beids[i], beids[i])
+      if brows[1] then
+        local bf = {}
+        for j = 1, #brows[1][2], 2 do bf[brows[1][2][j]] = brows[1][2][j + 1] end
+        if bf["kind"] == "confirm" and bf["fbmirror"] ~= "1" then
+          -- 这笔业务确实占到备钥并调成了：跨到备钥冲正并镜像回本钥账本
+          return {0, "not_here", bkid_v}
+        end
+      end
+    end
+  end
   return {0, "not_confirmed"}
 end
 local cost = tonumber(conf.f["cost"] or "1") or 1
@@ -295,7 +341,8 @@ local reversal_eid = redis.call("XADD", ledger_key, "*",
   "reserve_at", reserve_at,
   "of", tostring(cost),
   "note", note,
-  "pool_pid", pool_pid)
+  "pool_pid", pool_pid,
+  "fb_for", mirror_master)
 local score = tonumber(string.sub(reversal_eid, 1,
   string.find(reversal_eid, "-") - 1)) or now_ms
 if caller ~= "" then
@@ -303,6 +350,38 @@ if caller ~= "" then
              score, reversal_eid)
 end
 redis.call("ZADD", lii_key, score, reversal_eid)
+
+-- 跨钥冲正：把 reversal 也镜像到主钥账本（主钥流水/对账可见、可幂等），
+-- 并把“备钥已替主钥真用掉”的累计减回来。计数退回仍只发生在备钥原桶。
+local mirrored = 0
+if mirror_master ~= "" then
+  local mk = "{qk:" .. mirror_master .. "}ledger"
+  local meid = redis.call("XADD", mk, "*",
+    "kind", "reversal", "kid", mirror_master,
+    "res", conf.f["res"] or res_key,
+    "caller", caller,
+    "idem", idem,
+    "pool", pool,
+    "cost", tostring(amount),
+    "reason", "reversal",
+    "late", "0",
+    "reserve_at", reserve_at,
+    "of", tostring(cost),
+    "note", note,
+    "pool_pid", pool_pid,
+    "fb_for", mirror_master,
+    "fbmirror", "1",
+    "fb_key", kid)
+  local mscore = tonumber(string.sub(meid, 1, string.find(meid, "-") - 1)) or now_ms
+  if caller ~= "" then
+    redis.call("ZADD", "{qk:" .. mirror_master .. "}lci:" .. redis.sha1hex(caller),
+               mscore, meid)
+  end
+  redis.call("ZADD", "{qk:" .. mirror_master .. "}lii:" .. redis.sha1hex(idem),
+             mscore, meid)
+  redis.call("HINCRBY", "{qk:" .. mirror_master .. "}fbsv", "used", -amount)
+  mirrored = 1
+end
 
 -- 占用单还在时留个冲正标记（与流水互为双保险；单子 24h TTL，长期事实以流水为准）
 if #res_flat > 0 then
@@ -316,4 +395,5 @@ if #res_flat > 0 then
 end
 
 return {1, reversal_eid, amount, cost, tb_refunded, win_refunded, pool, caller,
-        pool_burst_refunded, pool_window_refunded, pool_pid}
+        pool_burst_refunded, pool_window_refunded, pool_pid, mirrored,
+        mirror_master ~= "" and mirror_master or ""}

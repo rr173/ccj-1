@@ -34,6 +34,7 @@ _SET_SHARE_SRC = (COMMON_DIR / "set_share.lua").read_text(encoding="utf-8")
 _REVERSE_SRC = (COMMON_DIR / "reverse.lua").read_text(encoding="utf-8")
 _POOL_QUOTA_SRC = (COMMON_DIR / "pool_quota.lua").read_text(encoding="utf-8")
 _POOL_MEMBER_SRC = (COMMON_DIR / "pool_member.lua").read_text(encoding="utf-8")
+_FAILOVER_MEMBER_SRC = (COMMON_DIR / "failover_member.lua").read_text(encoding="utf-8")
 # SHA 放在可变 dict 里：Redis 重启清空脚本缓存后由 script_runner 刷新，
 # 无需重启本进程
 _quota_sha: dict = {"sha": None}
@@ -41,6 +42,7 @@ _set_share_sha: dict = {"sha": None}
 _reverse_sha: dict = {"sha": None}
 _pool_quota_sha: dict = {"sha": None}
 _pool_member_sha: dict = {"sha": None}
+_failover_member_sha: dict = {"sha": None}
 
 
 def quota_eval(cfg_key_: str, tb_key_: str, shares_key_: str, *argv) -> tuple:
@@ -53,12 +55,15 @@ def set_share_eval(cfg_key_: str, shares_key_: str, caller: str, share_json: str
                            [cfg_key_, shares_key_, caller, share_json])
 
 
-def reverse_eval(kid: str, idem: str, amount: int, note: str) -> list:
-    """冲正一笔已调成的真用掉（reverse.lua 原子完成校验/退回/留笔）。"""
+def reverse_eval(kid: str, idem: str, amount: int, note: str,
+                 mirror_master: str = "") -> list:
+    """冲正一笔已调成的真用掉（reverse.lua 原子完成校验/退回/留笔）。
+    mirror_master 非空表示这笔实际在备钥 kid 上、冲正要镜像回该主钥。"""
     return run_script_sync(
         r, _REVERSE_SRC, _reverse_sha, 3,
         [keys.cfg_key(kid), keys.reservation_key(kid, idem),
-         keys.ledger_stream_key(kid), kid, idem, amount, note])
+         keys.ledger_stream_key(kid), kid, idem, amount, note,
+         mirror_master])
 
 
 def pool_quota_eval(pid: str, cfg: dict) -> list:
@@ -75,6 +80,14 @@ def pool_member_eval(pid: str, kid: str, action: str) -> list:
         [keys.pool_cfg_key(pid), keys.pool_members_key(pid),
          keys.pool_membership_key(kid), keys.cfg_key(kid),
          action, pid, kid])
+
+
+def failover_member_eval(kid: str, bkid: str, action: str) -> list:
+    return run_script_sync(
+        r, _FAILOVER_MEMBER_SRC, _failover_member_sha, 4,
+        [keys.failover_backup_key(kid), keys.failover_master_key(bkid),
+         keys.cfg_key(kid), keys.cfg_key(bkid),
+         action, kid, bkid])
 
 
 app = FastAPI(title="quota-control-plane", version="1.0.0")
@@ -375,6 +388,127 @@ def remove_pool_key(pid: str, kid: str) -> dict:
             "member_count": int(res[1])}
 
 
+def _failover_status(kid: str) -> dict:
+    """只读组装一把主钥的主备状态（不做存在性校验，调用方负责）。"""
+    bkid = r.get(keys.failover_backup_key(kid)) or ""
+    sv = r.hgetall(keys.failover_stats_key(kid)) if bkid else {}
+    active = int(sv.get("active", "0") or 0)
+    used = int(sv.get("used", "0") or 0)
+    streak = int(sv.get("streak", "0") or 0)
+    backup_state = None
+    if bkid:
+        bcfg = r.hgetall(keys.cfg_key(bkid))
+        backup_state = ("revoked" if bcfg.get(keys.F_REVOKED) == "1"
+                        else "active" if bcfg else "missing")
+    return {
+        "bound": bool(bkid),
+        "backup_key_id": bkid or None,
+        "backup_state": backup_state,
+        "failover_active": active > 0,
+        "on_backup_held": max(0, active),
+        "master_block_streak": max(0, streak),
+        "backup_consumed": max(0, used),
+    }
+
+
+@app.put("/v1/keys/{kid}/failover/{bkid}", dependencies=[Depends(require_admin)])
+def bind_failover(kid: str, bkid: str) -> dict:
+    """给一把还有效的主钥绑一把同样还有效的备钥（1:1）。
+
+    硬规则（failover_member.lua 在 Redis 单线程内原子保证）：
+      * 不能拿自己当备钥；两把都必须存在且未停用；
+      * 一把主钥同时只能绑一把备钥（换绑先解绑）；
+      * 一把备钥不能同时给好几把主钥顶；
+      * 备钥自己不能也绑着备钥（不允许链式顶上）。
+    """
+    try:
+        res = failover_member_eval(kid, bkid, "bind")
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    if int(res[0]) == 1:
+        return {"key_id": kid, "backup_key_id": bkid, "bound": True,
+                **_failover_status(kid)}
+    reason = res[1]
+    if reason == "key not found":
+        raise HTTPException(status_code=404, detail="key not found")
+    if reason == "self_backup":
+        raise HTTPException(status_code=409, detail={
+            "code": "self_backup",
+            "message": "a key cannot be its own backup",
+        })
+    if reason == "key_revoked":
+        who = res[2] if len(res) > 2 else "key"
+        raise HTTPException(status_code=409, detail={
+            "code": "key_revoked",
+            "message": f"the {who} key is revoked; only active keys can be paired",
+            "which": who,
+        })
+    if reason == "already_bound":
+        raise HTTPException(status_code=409, detail={
+            "code": "already_bound",
+            "message": "primary key already has a backup; unbind before rebinding",
+            "backup_key_id": res[2],
+        })
+    if reason == "backup_taken":
+        raise HTTPException(status_code=409, detail={
+            "code": "backup_taken",
+            "message": "backup key already serves another primary key",
+            "other_primary_key_id": res[2],
+        })
+    if reason == "failover_chain":
+        raise HTTPException(status_code=409, detail={
+            "code": "failover_chain",
+            "message": "backup key has its own backup; chained failover is not allowed",
+        })
+    raise HTTPException(status_code=400, detail=str(reason))
+
+
+@app.delete("/v1/keys/{kid}/failover/{bkid}", dependencies=[Depends(require_admin)])
+def unbind_failover(kid: str, bkid: str) -> dict:
+    """解绑：只断关系，不动任何在飞占用与计数。
+
+    已经占在备钥上的（含按业务号路由命中的）仍按占到的那把走完；新来的
+    不能再去占这把已经解绑的备钥——主钥侧没有路由的新请求只占主钥。
+    """
+    try:
+        res = failover_member_eval(kid, bkid, "unbind")
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    if int(res[0]) == 1:
+        return {"key_id": kid, "backup_key_id": bkid, "bound": False}
+    reason = res[1]
+    if reason == "not_bound":
+        raise HTTPException(status_code=404, detail={
+            "code": "not_bound",
+            "message": "primary key has no backup binding",
+        })
+    if reason == "binding_mismatch":
+        raise HTTPException(status_code=409, detail={
+            "code": "binding_mismatch",
+            "message": "the currently bound backup differs from the one given",
+            "backup_key_id": res[2],
+        })
+    raise HTTPException(status_code=400, detail=str(reason))
+
+
+@app.get("/v1/keys/{kid}/failover", dependencies=[Depends(require_admin)])
+def get_failover(kid: str) -> dict:
+    """查主备：绑的是哪一把、此刻是不是备钥在顶、主钥连着占不住几次、
+    备钥已经替它真用掉多少。没绑也返回 200（bound=false），便于轮询。"""
+    cfg = _load_config(kid)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="key not found")
+    try:
+        status = _failover_status(kid)
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    return {"key_id": kid, "state": "revoked" if cfg.get(keys.F_REVOKED) == "1"
+            else "active", **status}
+
+
 @app.get("/v1/keys/{kid}/quota", dependencies=[Depends(require_admin)])
 def get_quota(kid: str) -> dict:
     """只读查看当前额度：总盘 + 公共池 + 各点名调用方份额，一次看齐。
@@ -473,9 +607,15 @@ def get_quota(kid: str) -> dict:
 
     pool_view = _get_quota_pool_view(kid)
 
+    try:
+        fbk = r.get(keys.failover_backup_key(kid))
+    except redis.exceptions.RedisError:
+        fbk = None
+
     return {
         "key_id": kid,
         "state": state,
+        "failover": {"bound": bool(fbk), "backup_key_id": fbk or None},
         "burst": {**total["burst"],
                   "refill_per_second": round(1000.0 / refill_ms, 3) if refill_ms > 0 else None},
         "window": {"seconds": int(win_s), **total["window"]},
@@ -581,11 +721,24 @@ def reverse_consumption(kid: str, body: ReverseRequest) -> dict:
             redis.exceptions.BusyLoadingError) as exc:
         raise QuotaStoreUnavailable() from exc
 
+    # 这笔业务实际占到了绑定的备钥（主钥账本里只有镜像）：跨到备钥执行，
+    # 冲正退回备钥原计数器，并把 reversal 镜像回主钥账本/统计。
+    actual_kid = kid
+    if int(res[0]) == 0 and res[1] == "not_here" and len(res) > 2:
+        actual_kid = res[2]
+        try:
+            res = reverse_eval(actual_kid, body.idem_key, body.amount,
+                               body.note, mirror_master=kid)
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+                redis.exceptions.BusyLoadingError) as exc:
+            raise QuotaStoreUnavailable() from exc
+
     code = int(res[0])
+    on_backup = actual_kid != kid
     if code == 1:
         (_, eid, amount_done, orig_cost, tb_ref, win_ref, pool, caller,
-         pool_tb_ref, pool_win_ref, pool_id) = res
-        return {
+         pool_tb_ref, pool_win_ref, pool_id) = res[:11]
+        out = {
             "key_id": kid,
             "reversal_id": eid,
             "idem_key": body.idem_key,
@@ -604,17 +757,28 @@ def reverse_consumption(kid: str, body: ReverseRequest) -> dict:
             "caller": caller or None,
             "note": body.note,
         }
+        if on_backup:
+            # 这笔是备钥顶上时真用掉的：计数冲在备钥上，主钥账本多了镜像
+            out["failover"] = {"served_by": "backup",
+                               "actual_key_id": actual_kid,
+                               "mirrored_to_primary_ledger": True}
+        return out
     if code == 2:
         # 这笔业务已经冲过：把原冲正结论还给调用方（幂等，不再动账、不留笔）
-        _, eid, amount_done, orig_cost = res
-        return JSONResponse(status_code=200, content={
+        _, eid, amount_done, orig_cost = res[:4]
+        cross_actual = res[4] if len(res) > 4 else ""
+        content = {
             "key_id": kid,
             "reversal_id": eid,
             "idem_key": body.idem_key,
             "amount": int(amount_done),
             "confirmed_cost": int(orig_cost),
             "already_reversed": True,
-        })
+        }
+        if on_backup or (cross_actual and cross_actual != kid):
+            content["failover"] = {"served_by": "backup",
+                                   "actual_key_id": cross_actual or actual_kid}
+        return JSONResponse(status_code=200, content=content)
 
     reason = res[1]
     if reason == "key not found":

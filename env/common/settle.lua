@@ -74,6 +74,7 @@ local holds_key    = h.holds
 local wholds_key   = h.wholds
 local pool_pid     = h.pool_pid or ""
 local pool_pres    = h.pool_pres or ""
+local fb_for       = h.fb_for or ""  -- 非空表示这张单子是顶上备钥替该主钥占的
 local pcfg_key     = pool_pid ~= "" and ("{qp:" .. pool_pid .. "}cfg") or ""
 local SCALE        = 1000
 
@@ -90,7 +91,8 @@ local function ledger_add(kind, reason, late)
     "reason", reason or "",
     "late", late and "1" or "0",
     "reserve_at", tostring(h.reserved_at_ms or 0),
-    "pool_pid", pool_pid)
+    "pool_pid", pool_pid,
+    "fb_for", fb_for)
   local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
   local caller = h.caller or ""
   if caller ~= "" then
@@ -110,6 +112,40 @@ local function remove_holds(target_holds, target_wholds, rkey, cost_val)
   end
   if target_wholds and target_wholds ~= "" then
     redis.call("ZREM", target_wholds, unpack(mm))
+  end
+end
+
+-- 顶上备钥替主钥发生的事件，镜像一笔到【主钥账本】：
+-- 主钥视角的流水/对账因此能看到“备钥替它顶过哪几笔、成了没成”；
+-- 镜像带 fbmirror=1 与 fb_key=<备钥kid>，对账单/对账据此前缀区分，
+-- 不把镜像算进主钥自己的 win 桶计数对账。计数仍只在备钥扣，镜像绝不重复扣。
+local function ledger_mirror_primary(kind, reason, late)
+  if fb_for == "" then return end
+  local mk = "{qk:" .. fb_for .. "}ledger"
+  local eid = redis.call("XADD", mk, "*",
+    "kind", kind, "kid", fb_for,
+    "res", res_key,
+    "caller", h.caller or "",
+    "idem", h.idem or "",
+    "pool", h.pool or "",
+    "cost", tostring(cost),
+    "reason", reason or "",
+    "late", late and "1" or "0",
+    "reserve_at", tostring(h.reserved_at_ms or 0),
+    "pool_pid", pool_pid,
+    "fb_for", fb_for,
+    "fbmirror", "1",
+    "fb_key", kid or "")
+  local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
+  local caller = h.caller or ""
+  if caller ~= "" then
+    redis.call("ZADD", "{qk:" .. fb_for .. "}lci:" .. redis.sha1hex(caller),
+               score, eid)
+  end
+  local idem_v = h.idem or ""
+  if idem_v ~= "" then
+    redis.call("ZADD", "{qk:" .. fb_for .. "}lii:" .. redis.sha1hex(idem_v),
+               score, eid)
   end
 end
 
@@ -210,7 +246,11 @@ if action == "confirm" then
       remove_holds(holds_key, wholds_key, res_key, cost)
       if ph_confirm then settle_pool_release(ph_confirm) end
       redis.call("HSET", res_key, "outcome", "released")
+      if fb_for ~= "" then
+        redis.call("HINCRBY", "{qk:" .. fb_for .. "}fbsv", "active", -1)
+      end
       ledger_add("release", "pool_stopped", false)
+      ledger_mirror_primary("release", "pool_stopped", false)
       return {0, "pool_stopped"}
     end
   end
@@ -281,9 +321,20 @@ if action == "confirm" then
   end
 
   redis.call("HSET", res_key, "outcome", "confirmed")
+  -- 顶上备钥真用掉一笔：主钥视角“备钥已替它真用掉多少”加一。正常确认时
+  -- 这笔还在顶，active 同步减一；迟到确认（单子此前已超时退回，active 在
+  -- reserve.lua/sweep.lua 超时终结时减过）只加真用掉，绝不重复减 active。
+  if fb_for ~= "" then
+    local sv = "{qk:" .. fb_for .. "}fbsv"
+    redis.call("HINCRBY", sv, "used", cost)
+    if not late_confirm then
+      redis.call("HINCRBY", sv, "active", -1)
+    end
+  end
   -- 流水留一笔 confirm（迟到的真调用标 late=1）；真用掉以此为唯一口径，
   -- 与令牌桶/窗口的真扣在同一原子动作里，对账单据此与余量侧真用掉对账。
   ledger_add("confirm", "", late_confirm)
+  ledger_mirror_primary("confirm", "", late_confirm)
   return {1, "confirmed", tonumber(h.lease_exp or 0)}
 end
 
@@ -312,7 +363,11 @@ if pool_pid ~= "" and ph_release then
 end
 
 redis.call("HSET", res_key, "outcome", "released")
+if fb_for ~= "" then
+  redis.call("HINCRBY", "{qk:" .. fb_for .. "}fbsv", "active", -1)
+end
 -- 上游 5xx / 连不上 / 调用方断连的即时退回（force=1），或按过期显式释放，
 -- 留一笔 release(reason=upstream) 流水。同一业务号再来只回原结论，不留第二笔。
 ledger_add("release", "upstream", false)
+ledger_mirror_primary("release", "upstream", false)
 return {1, "released", tonumber(h.lease_exp or 0)}

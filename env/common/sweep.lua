@@ -101,7 +101,8 @@ for _, m in ipairs(expired_members) do
       else
         local f = redis.call("HMGET", rkey, "outcome", "lease_exp_ms", "cost",
                              "holds", "wholds", "caller", "idem", "pool",
-                             "reserved_at_ms", "kid", "pool_pid", "pool_pres")
+                             "reserved_at_ms", "kid", "pool_pid", "pool_pres",
+                             "fb_for")
         if f[1] == "" and (tonumber(f[2] or "0") or 0) <= now_ms and f[10] then
           local cost_val = tonumber(f[3] or "1") or 1
           local ppid, ppr = f[11] or "", f[12] or ""
@@ -113,6 +114,9 @@ for _, m in ipairs(expired_members) do
               zremove_all(pf[4], pf[5], ppr, pcost)
               redis.call("HSET", ppr, "outcome", "expired")
             end
+          end
+          if f[13] and f[13] ~= "" then
+            redis.call("HINCRBY", "{qk:" .. f[13] .. "}fbsv", "active", -1)
           end
           zremove_all(f[4], f[5], rkey, cost_val)
           redis.call("HSET", rkey, "outcome", "expired")
@@ -126,7 +130,35 @@ for _, m in ipairs(expired_members) do
             "reason", "timeout",
             "late", "0",
             "reserve_at", f[9] or "0",
-            "pool_pid", ppid)
+            "pool_pid", ppid,
+            "fb_for", f[13] or "")
+          if f[13] and f[13] ~= "" then
+            -- 顶上备钥的单子被冷池兜底超时：同步镜像一笔 timeout 到主钥账本
+            local meid = redis.call("XADD", "{qk:" .. f[13] .. "}ledger", "*",
+              "kind", "release", "kid", f[13],
+              "res", rkey,
+              "caller", f[6] or "",
+              "idem", f[7] or "",
+              "pool", f[8] or "",
+              "cost", tostring(cost_val),
+              "reason", "timeout",
+              "late", "0",
+              "reserve_at", f[9] or "0",
+              "pool_pid", ppid,
+              "fb_for", f[13],
+              "fbmirror", "1",
+              "fb_key", f[10])
+            local mscore = tonumber(string.sub(meid, 1,
+              string.find(meid, "-", 1, true) - 1)) or now_ms
+            if f[6] and f[6] ~= "" then
+              redis.call("ZADD", "{qk:" .. f[13] .. "}lci:"
+                .. redis.sha1hex(f[6]), mscore, meid)
+            end
+            if f[7] and f[7] ~= "" then
+              redis.call("ZADD", "{qk:" .. f[13] .. "}lii:"
+                .. redis.sha1hex(f[7]), mscore, meid)
+            end
+          end
           local dash = string.find(eid, "-", 1, true)
           local score = dash and tonumber(string.sub(eid, 1, dash - 1)) or now_ms
           if f[6] and f[6] ~= "" then

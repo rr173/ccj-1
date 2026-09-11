@@ -41,6 +41,14 @@
 --  9  client             调用方名（X-Client-Id；空串表示匿名，只可能命中公共池）
 --  10 pool_pid           跨密钥共享池 ID；空串表示该密钥当前不进池（可选）
 --  11 pool_pres          预生成的池侧占用单 key；与密钥侧占用单成对超时释放（可选）
+--  12 fb_role            主备角色："master"（平时占主钥；占不住本次也未顶上）/
+--                        "backup"（这笔是主钥占不住后立刻顶上备钥的新占）/
+--                        空串（没绑备钥的普通路径，与旧版完全一致）
+--  13 fb_master_kid      role=backup 时的主钥 kid（统计/路由都写回主钥 tag）
+--  14 fb_route_key       role=backup 且带业务号时，主钥侧的业务号路由 key
+--                        {qk:<master>}fbrt:<sha256(业务号)>，与备钥占用同一原子动作
+--                        落盘；空串表示匿名顶上或不需要路由
+--  15 fb_stats_key       主钥侧统计 hash {qk:<master>}fbsv（空串则不碰统计）
 --
 -- 返回（全部为整/字符串数组）：
 --   {1, remaining_burst, remaining_window, lease_expires_unix}        占成功
@@ -78,6 +86,10 @@ local lease_seconds   = tonumber(ARGV[8])
 local client          = ARGV[9] or ""
 local pool_pid        = ARGV[10] or ""
 local pool_pres       = ARGV[11] or ""
+local fb_role         = ARGV[12] or ""
+local fb_master_kid   = ARGV[13] or ""
+local fb_route_key    = ARGV[14] or ""
+local fb_stats_key    = ARGV[15] or ""
 
 if not capacity or not refill_ms or not window_seconds or not window_quota
    or not cost or not lease_seconds or capacity <= 0 or refill_ms <= 0
@@ -109,7 +121,8 @@ local function ledger_add(kind, rk, cost_val, reason, late, rfields)
     "reason", reason or "",
     "late", late and "1" or "0",
     "reserve_at", tostring(rfields.reserve_at_ms or 0),
-    "pool_pid", pool_pid)
+    "pool_pid", pool_pid,
+    "fb_for", rfields.fb_for or "")
   local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
   local caller = rfields.caller or ""
   if caller ~= "" then
@@ -124,6 +137,39 @@ local function ledger_add(kind, rk, cost_val, reason, late, rfields)
   return eid
 end
 
+-- 顶上事件镜像到【主钥账本】（与 settle.lua 的同名逻辑对齐）：
+-- 主钥流水/对账能看到备钥替它顶过的每一笔；镜像带 fbmirror=1，
+-- 计数仍只在备钥扣，主钥对账单不把镜像计入 win 桶对账。
+local function ledger_mirror_primary(kind, rk, cost_val, reason, late, rfields)
+  if fb_role ~= "backup" or fb_master_kid == "" then return end
+  local mk = "{qk:" .. fb_master_kid .. "}ledger"
+  local eid = redis.call("XADD", mk, "*",
+    "kind", kind, "kid", fb_master_kid,
+    "res", rk,
+    "caller", rfields.caller or "",
+    "idem", rfields.idem or "",
+    "pool", rfields.pool or "",
+    "cost", tostring(cost_val),
+    "reason", reason or "",
+    "late", late and "1" or "0",
+    "reserve_at", tostring(rfields.reserve_at_ms or 0),
+    "pool_pid", pool_pid,
+    "fb_for", fb_master_kid,
+    "fbmirror", "1",
+    "fb_key", kid)
+  local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
+  local caller = rfields.caller or ""
+  if caller ~= "" then
+    redis.call("ZADD", "{qk:" .. fb_master_kid .. "}lci:" .. redis.sha1hex(caller),
+               score, eid)
+  end
+  local idem_v = rfields.idem or ""
+  if idem_v ~= "" then
+    redis.call("ZADD", "{qk:" .. fb_master_kid .. "}lii:" .. redis.sha1hex(idem_v),
+               score, eid)
+  end
+end
+
 -- 把一张“过了约定回音时限还没回音”的占用单终结为超时退回：
 -- 占用登记从 ZSET 删除（额度立刻能再占），单子置 outcome="expired"，
 -- 留一笔 release/reason=timeout 流水。幂等：只处理还占着（outcome=""）
@@ -133,7 +179,7 @@ end
 local function finalize_expired(rkey)
   local f = redis.call("HMGET", rkey, "outcome", "lease_exp_ms", "cost",
                        "holds", "wholds", "caller", "idem", "pool",
-                       "reserved_at_ms", "pool_pid", "pool_pres")
+                       "reserved_at_ms", "pool_pid", "pool_pres", "fb_for")
   local fo = f[1]
   if not fo or fo ~= "" then
     return false
@@ -156,7 +202,39 @@ local function finalize_expired(rkey)
   redis.call("HSET", rkey, "outcome", "expired")
   ledger_add("release", rkey, cost_val, "timeout", false,
              {caller = f[6] or "", idem = f[7] or "", pool = f[8] or "",
-              reserve_at_ms = f[9] or "0"})
+              reserve_at_ms = f[9] or "0", fb_for = f[12] or ""})
+  -- 这笔是顶上备钥占的：备钥侧单子先超时，主钥视角的“此刻在顶”减一
+  local fb_for = f[12] or ""
+  if fb_for ~= "" then
+    redis.call("HINCRBY", "{qk:" .. fb_for .. "}fbsv", "active", -1)
+    -- 超时退回也镜像一笔到主钥账本（fbmirror=1，不重复扣计数）
+    local mk = "{qk:" .. fb_for .. "}ledger"
+    local eid = redis.call("XADD", mk, "*",
+      "kind", "release", "kid", fb_for,
+      "res", rkey,
+      "caller", f[6] or "",
+      "idem", f[7] or "",
+      "pool", f[8] or "",
+      "cost", tostring(cost_val),
+      "reason", "timeout",
+      "late", "0",
+      "reserve_at", f[9] or "0",
+      "pool_pid", f[10] or "",
+      "fb_for", fb_for,
+      "fbmirror", "1",
+      "fb_key", kid)
+    local mscore = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
+    local mcaller = f[6] or ""
+    if mcaller ~= "" then
+      redis.call("ZADD", "{qk:" .. fb_for .. "}lci:" .. redis.sha1hex(mcaller),
+                 mscore, eid)
+    end
+    local midem = f[7] or ""
+    if midem ~= "" then
+      redis.call("ZADD", "{qk:" .. fb_for .. "}lii:" .. redis.sha1hex(midem),
+                 mscore, eid)
+    end
+  end
   -- 跨密钥池请求的密钥侧单子先超时：同步摘掉池侧占用，避免另一边还挂着。
   -- 池侧 timeout 流水由 pool_reserve.lua 在从池侧发现时补；这里已经为密钥
   -- 账本记过同一原因，不能在密钥流水上重复记。
@@ -215,6 +293,17 @@ end
 -- 3) revoked 检查在任何份额逻辑之前：密钥一停用，所有份额与公共池立即失效
 if redis.call("HGET", cfg_key, "revoked") == "1" then
   return {0, "revoked", 0, 0, 0}
+end
+
+-- 主备顶上：主钥因突发/窗口占不住的，先记一笔“连着占不住”（顶上判定由
+-- 数据面在本脚本之外编排：先试主钥、占不住再试备钥，绝不同时咬住两头）。
+-- 只有主钥路径记 streak；备钥自己满了不再累加。幂等重放不碰统计。
+local function fb_blocked(reason, retry_ms, rem_b, rem_w)
+  if fb_role == "master" and fb_stats_key ~= ""
+     and (reason == "burst_limited" or reason == "window_limited") then
+    redis.call("HINCRBY", fb_stats_key, "streak", 1)
+  end
+  return {0, reason, retry_ms, rem_b, rem_w}
 end
 
 local SCALE = 1000  -- 令牌内部放大倍数
@@ -304,8 +393,8 @@ local need_tokens = cost * SCALE
 if eff_capacity <= 0 then
   local retry_ms = win_ms - elapsed_in_bucket
   if retry_ms < 1 then retry_ms = 1 end
-  return {0, "burst_limited", retry_ms, 0,
-          math.max(eff_win_quota - window_used - held_window, 0)}
+  return fb_blocked("burst_limited", retry_ms, 0,
+          math.max(eff_win_quota - window_used - held_window, 0))
 end
 
 -- 7) 令牌桶（短周期突发）：占用阶段只读不扣，确认时才真正扣减
@@ -345,7 +434,7 @@ if avail_tokens < need_tokens then
   local full_ms = eff_capacity * refill_ms
   if wait_ms > full_ms then wait_ms = full_ms end
   if wait_ms < 1 then wait_ms = 1 end
-  return {0, "burst_limited", wait_ms, rem_burst, rem_window}
+  return fb_blocked("burst_limited", wait_ms, rem_burst, rem_window)
 end
 
 if window_used + held_window + cost > eff_win_quota then
@@ -354,7 +443,7 @@ if window_used + held_window + cost > eff_win_quota then
   -- 宁可让调用方多等，也不给出偏小的 Retry-After 引导其过早重试。
   local retry_ms = win_ms - elapsed_in_bucket
   if retry_ms < 1 then retry_ms = 1 end
-  return {0, "window_limited", retry_ms, rem_burst, 0}
+  return fb_blocked("window_limited", retry_ms, rem_burst, 0)
 end
 
 -- 9) 占成功：登记占用（ZSET，member=占用单号#序号，score=回音时限），
@@ -396,13 +485,34 @@ redis.call("HSET", res_key,
   "rem_window", new_rem_window,
   "pool_pid", pool_pid,
   "pool_pres", pool_pres,
+  "fb_for", fb_role == "backup" and fb_master_kid or "",
   "outcome", "")
+-- 顶上备钥占成：业务号路由（同一笔永远走第一次占到的那把）与“此刻在顶”
+-- 计数跟备钥占用在同一原子动作里落盘，绝没有“先占主再占备咬住两头”的窗口。
+if fb_role == "backup" then
+  if fb_route_key ~= "" and idem ~= "" then
+    redis.call("SET", fb_route_key, kid)
+    redis.call("EXPIRE", fb_route_key, 86400)
+  end
+  if fb_master_kid ~= "" then
+    redis.call("HINCRBY", "{qk:" .. fb_master_kid .. "}fbsv", "active", 1)
+  end
+end
+-- 主钥自己新占成一次：连续占不住计数清零——主钥又能占住以后，新来的回主钥，
+-- streak 归零本身就是“现在回主钥了”的信号（由主钥路径实时判定，不看这个数）。
+if fb_role == "master" and fb_stats_key ~= "" then
+  redis.call("HSET", fb_stats_key, "streak", 0)
+end
 -- 占用流水：占成功就留一笔（与占用登记在同一原子动作里落盘）。
 -- 之后 confirm/release 由 settle.lua 各留一笔；同一业务号状态机保证
 -- 每种结局只记一次，再来只回原结论、不再留笔。
 ledger_add("reserve", res_key, cost, "", false,
            {caller = client, idem = idem, pool = pool,
-            reserve_at_ms = now_ms})
+            reserve_at_ms = now_ms,
+            fb_for = fb_role == "backup" and fb_master_kid or ""})
+ledger_mirror_primary("reserve", res_key, cost, "", false,
+                      {caller = client, idem = idem, pool = pool,
+                       reserve_at_ms = now_ms})
 -- 占用单留存：带业务号的留 24h（与旧版幂等记录一致），期间同一业务号重放
 -- 都能拿到原结论；匿名单子没人会按号查，留到约定回音时限加宽限即可。
 -- 注意：占用的“额度效力”只到约定回音时限（ZSET score），单子本身留得再久
