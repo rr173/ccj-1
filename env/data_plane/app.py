@@ -19,6 +19,11 @@
   被点名的调用方只占用自己的份额，未点名的只占用公共池（总量 − 全部预留），
   两边互不相通；密钥停用后份额与公共池一并立即失效。
 
+跨密钥共享池（reserve.lua + pool_reserve.lua）：
+  控制面可把多把有效密钥放入同一个池。成员请求必须先占住密钥自己的额度，
+  再占住池的聚合额度；池满即拒绝，即使该密钥自己还有额度。密钥出池只影响
+  新请求，出池前已占着的配对单仍按原池确认/退回；池停后新占用和在飞确认都拒绝。
+
 幂等（同一业务号）：
   调用方带 Idempotency-Key 时，占用单以该业务号命名。同一业务号再来，
   reserve.lua 直接返回同一张占用单，绝不二次占额；数据面凭单子上已记录的
@@ -81,11 +86,13 @@ class KeyLockRegistry:
 registry = KeyLockRegistry(MAX_KEY_LOCKS)
 redis_client: aioredis.Redis = None  # type: ignore
 _RESERVE_SRC = (COMMON_DIR / "reserve.lua").read_text(encoding="utf-8")
+_POOL_RESERVE_SRC = (COMMON_DIR / "pool_reserve.lua").read_text(encoding="utf-8")
 _SETTLE_SRC = (COMMON_DIR / "settle.lua").read_text(encoding="utf-8")
 _SWEEP_SRC = (COMMON_DIR / "sweep.lua").read_text(encoding="utf-8")
 # SHA 放在可变 dict 里：Redis 重启清空脚本缓存后由 script_runner 重载刷新，
 # 无需重启数据面进程
 _reserve_sha: dict = {"sha": None}
+_pool_reserve_sha: dict = {"sha": None}
 _settle_sha: dict = {"sha": None}
 _sweep_sha: dict = {"sha": None}
 _sweep_task: asyncio.Task | None = None
@@ -147,8 +154,9 @@ class StoreUnavailableError(Exception):
     """记额度那层不可用（连接不上 / 重启中 / 只读故障切换）。"""
 
 
-async def reserve(kid: str, idem: str, client: str, res_key: str) -> list:
-    """先占额度：原子判定 + 登记占用。返回 reserve.lua 的结果数组。"""
+async def reserve(kid: str, idem: str, client: str, res_key: str,
+                  pid: str = "", pool_res_key: str = "") -> list:
+    """先占密钥自己的额度；若密钥在共享池里，再由 pool_reserve 占池额度。"""
     try:
         cfg = await redis_client.hgetall(keys.cfg_key(kid))
     except (aioredis.ConnectionError, aioredis.TimeoutError,
@@ -156,6 +164,14 @@ async def reserve(kid: str, idem: str, client: str, res_key: str) -> list:
         raise StoreUnavailableError() from exc
     if not cfg:
         return [3, "key not found"]
+
+    try:
+        current_pid = await redis_client.get(keys.pool_membership_key(kid))
+    except (aioredis.ConnectionError, aioredis.TimeoutError,
+            aioredis.BusyLoadingError) as exc:
+        raise StoreUnavailableError() from exc
+    current_pid = current_pid or pid
+    paired_pool_res = keys.pool_reservation_key(current_pid, kid, idem) if current_pid else ""
 
     args = [
         kid,
@@ -167,16 +183,82 @@ async def reserve(kid: str, idem: str, client: str, res_key: str) -> list:
         idem,
         RESERVATION_TTL_SECONDS,
         client,
+        current_pid,
+        paired_pool_res,
     ]
     lua_keys = [keys.cfg_key(kid), keys.tb_key(kid), keys.shares_key(kid),
                 res_key, keys.ledger_stream_key(kid)]
     try:
-        return await run_script_async(
+        key_result = await run_script_async(
             redis_client, _RESERVE_SRC, _reserve_sha, 5,
             [*lua_keys, *args])
     except (aioredis.ConnectionError, aioredis.TimeoutError,
             aioredis.BusyLoadingError) as exc:
         raise StoreUnavailableError() from exc
+
+    # 非成功且非“同一张在飞单子”的结果无需再占池；只有真的占住/继续这张单子时，
+    # 才把密钥与池两侧配成一对。
+    if int(key_result[0]) not in (1, 2):
+        return key_result
+    if not current_pid:
+        return key_result
+    if int(key_result[0]) == 2 and key_result[2] != "":
+        # 已终结/超时的同业务号由现有幂等响应处理，不能再占池。
+        return key_result
+    if int(key_result[0]) == 2 and len(key_result) >= 7 and key_result[5]:
+        # 在飞重放必须沿用第一次占的原池/原池单，即使密钥刚刚被移动到别的池。
+        current_pid = key_result[5]
+        paired_pool_res = key_result[6]
+
+    pool_res_key = paired_pool_res
+    try:
+        pcfg = await redis_client.hgetall(keys.pool_cfg_key(current_pid))
+    except (aioredis.ConnectionError, aioredis.TimeoutError,
+            aioredis.BusyLoadingError) as exc:
+        raise StoreUnavailableError() from exc
+    if not pcfg:
+        # 归属指向了不存在/已删除的池：保守拒绝新占并释放刚占的密钥侧。
+        await settle(kid, res_key, "release", force=True)
+        return [0, "pool_stopped", 0, 0, 0]
+
+    pool_keys = [
+        keys.pool_cfg_key(current_pid),
+        keys.pool_tb_key(current_pid),
+        keys.pool_members_key(current_pid),
+        keys.pool_membership_key(kid),
+        pool_res_key,
+    ]
+    pool_args = [
+        current_pid, kid,
+        pcfg[keys.F_CAPACITY], pcfg[keys.F_REFILL_MS],
+        pcfg[keys.F_WINDOW_SECONDS], pcfg[keys.F_WINDOW_QUOTA],
+        1, idem, RESERVATION_TTL_SECONDS, client, res_key,
+    ]
+    try:
+        pool_result = await run_script_async(
+            redis_client, _POOL_RESERVE_SRC, _pool_reserve_sha, 5,
+            [*pool_keys, *pool_args])
+    except (aioredis.ConnectionError, aioredis.TimeoutError,
+            aioredis.BusyLoadingError) as exc:
+        raise StoreUnavailableError() from exc
+
+    pc = int(pool_result[0])
+    if pc == 1:
+        # 只有“新占成密钥侧”时才可能走到这里；code=2 在飞由下面处理。
+        return [1, pool_result[1], pool_result[2], key_result[3], pool_res_key]
+    if pc == 2 and pool_result[2] == "":
+        return [2, key_result[1], "", pool_result[3], pool_result[4], pool_res_key]
+    if pc == 0 and pool_result[1] in {"burst_limited", "window_limited"}:
+        # 密钥自己还有但池满：立即释放刚占的密钥侧；响应只报池还需等多久。
+        await settle(kid, res_key, "release", force=True)
+        return pool_result
+    if pc == 0 and pool_result[1] == "pool_stopped":
+        await settle(kid, res_key, "release", force=True)
+        return pool_result
+    if pc == 3 and pool_result[1] == "not pool member":
+        # 并发移出池：这次请求不再受池限制，沿用密钥侧已占住的额度。
+        return key_result
+    return pool_result
 
 
 async def settle(kid: str, res_key: str, action: str, force: bool) -> list | None:
@@ -198,7 +280,8 @@ async def settle(kid: str, res_key: str, action: str, force: bool) -> list | Non
 async def sweep_once() -> int:
     """把所有池里过期未回音的占用单终结为超时退回（sweep.lua）。
 
-    公共池突发占用登记 {qk:*}holds；份额池 {qk:*}sholds:<sha1>。
+    公共池突发占用登记 {qk:*}holds；份额池 {qk:*}sholds:<sha1>；
+    跨密钥共享池 {qp:*}holds。
     窗口占用登记（wholds/swholds）里的单子必然也在对应的突发登记里，
     扫一套就够。SCAN 分批枚举池，每池单脚本最多处理 100 笔，避免长尾拖太久。
     """
@@ -224,7 +307,7 @@ async def sweep_once() -> int:
 async def _scan_holds():
     """枚举所有突发占用登记 key（公共池 + 各份额池）。"""
     seen = set()
-    for pattern in ("{qk:*}holds", "{qk:*}sholds:*"):
+    for pattern in ("{qk:*}holds", "{qk:*}sholds:*", "{qp:*}holds"):
         async for k in redis_client.scan_iter(match=pattern, count=200):
             if k not in seen:
                 seen.add(k)
@@ -253,6 +336,8 @@ async def handle_proxy(request: web.Request) -> web.Response:
     # 占用单号：带业务号（Idempotency-Key）时由业务号决定——同一业务号再来，
     # 命中同一张占用单，绝不二次占额；匿名调用每次一张新单子
     res_key = keys.reservation_key(kid, idem) if idem else keys.reservation_key(kid)
+    # 共享池占用单先按 (kid,业务号) 预生成；reserve() 读取当前归属后可覆盖 pid。
+    pool_res_key = ""
     # 调用方身份：用于同一把密钥内多个租户之间的轮转公平与份额隔离
     client = request.headers.get("X-Client-Id") or (
         request.remote.split(":")[0] if request.remote else "anon")
@@ -265,7 +350,7 @@ async def handle_proxy(request: web.Request) -> web.Response:
         await queue.acquire(client)
     try:
         try:
-            result = await reserve(kid, idem, client, res_key)
+            result = await reserve(kid, idem, client, res_key, pool_res_key=pool_res_key)
         except StoreUnavailableError:
             # 记额度层重启/不可用：明确告知稍后重试，绝不“放行”也不裸 500
             return _error(503, "quota_store_unavailable", retry_after_ms=2000,
@@ -284,7 +369,7 @@ async def handle_proxy(request: web.Request) -> web.Response:
         # 同一业务号再来：返回同一张占用单，绝不二次占额。
         # outcome 非空说明这笔业务此前已了结（数据面可能崩溃过，调用方在重试），
         # 直接把当时的结论还给它，不再接触上游。
-        _, lease_exp, outcome, rem_burst, rem_window = result
+        _, lease_exp, outcome, rem_burst, rem_window = result[:5]
         rem_burst, rem_window = int(rem_burst), int(rem_window)
         if outcome == "confirmed":
             return _error(409, "idempotent_replay_confirmed",
@@ -312,12 +397,15 @@ async def handle_proxy(request: web.Request) -> web.Response:
         _, reason, retry_ms, rem_burst, rem_window = result
         if reason == "revoked":
             return _error(403, "key_revoked")
+        if reason == "pool_stopped":
+            return _error(403, "pool_stopped",
+                          detail="quota pool is stopped; it cannot accept new reservations")
         return _error(429, reason, retry_after_ms=int(retry_ms),
                       remaining_burst=int(rem_burst),
                       remaining_window=int(rem_window))
 
     # code == 1，占成功：放行调上游，调完按结果了结
-    _, rem_burst, rem_window, lease_exp = result
+    _, rem_burst, rem_window, _lease_exp = result[:4]
     return await forward_and_settle(request, kid, res_key,
                                     int(rem_burst), int(rem_window))
 
@@ -339,7 +427,12 @@ async def forward_and_settle(request: web.Request, kid: str, res_key: str,
             payload = await up.read()
             if up.status < 500:
                 # 上游给了业务应答（含 4xx：调用方自己的问题，额度照算）→ 确认
-                await settle(kid, res_key, "confirm", force=False)
+                settled = await settle(kid, res_key, "confirm", force=False)
+                if settled and str(settled[0]) == "0" and settled[1] == "pool_stopped":
+                    return _error(403, "pool_stopped",
+                                  remaining_burst=rem_burst,
+                                  remaining_window=rem_window,
+                                  detail="quota pool stopped before settlement; this call is not counted")
                 resp_headers = {
                     k: v for k, v in up.headers.items()
                     if k.lower() not in HOP_BY_HOP

@@ -20,6 +20,7 @@ F_CREATED_AT = "created_at"
 # 公共池配额 = 总量 - reserved；缺省 0（未设任何份额时行为与旧版一致）。
 F_RESERVED_BURST = "reserved_burst"
 F_RESERVED_WINDOW = "reserved_window"
+F_STOPPED = "stopped"
 
 DEFAULT_RESERVATION_TTL_SECONDS = 60  # 占用约定的回音时限：超时未了结，
                                       # 占着的额度自动退回池里给别人用
@@ -108,3 +109,40 @@ def ledger_idem_key(kid: str, idem: str) -> str:
     """按业务号（Idempotency-Key）的流水索引：ZSET，同上。
     一个业务号至多占/结/退三笔，用 sha1 与 Lua 侧 redis.sha1hex 对齐。"""
     return f"{{qk:{kid}}}lii:{hashlib.sha1(idem.encode('utf-8')).hexdigest()}"
+
+
+# ── 跨密钥共享额度池 ───────────────────────────────────────────────────────
+# 池配置与计数使用独立 hash tag（{qp:<pid>}）；成员资格放在密钥 hash tag 下，
+# 由管理脚本跨 slot 原子校验/写入。单机 Redis 可直接执行跨 key Lua；若使用
+# Redis Cluster，需要为这些管理/占用脚本改用外部事务协调或同 slot 键设计。
+def pool_cfg_key(pid: str) -> str:
+    return f"{{qp:{pid}}}cfg"
+
+
+def pool_tb_key(pid: str) -> str:
+    return f"{{qp:{pid}}}tb"
+
+
+def pool_members_key(pid: str) -> str:
+    """池成员 hash：field=kid，value=加入时间（毫秒）。"""
+    return f"{{qp:{pid}}}members"
+
+
+def pool_membership_key(kid: str) -> str:
+    """密钥当前归属池：string，内容为 pid；不存在表示未进池。"""
+    return f"{{qk:{kid}}}pool"
+
+
+def pool_reservation_key(pid: str, kid: str, idempotency_key: str = "") -> str:
+    """池侧占用单。带业务号时由 (pid,kid,业务号) 决定，避免不同密钥但业务号
+    相同发生碰撞；匿名调用随机一张。"""
+    if idempotency_key:
+        raw = f"{pid}\0{kid}\0{idempotency_key}".encode("utf-8")
+        h = hashlib.sha256(raw).hexdigest()
+        return f"{{qp:{pid}}}pres:{h}"
+    return f"{{qp:{pid}}}pres:{secrets.token_hex(16)}"
+
+
+def pool_win_prefix(pid: str) -> str:
+    return f"{{qp:{pid}}}win:"
+

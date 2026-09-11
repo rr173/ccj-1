@@ -39,6 +39,8 @@
 --  8  lease_seconds      约定回音时限（秒）：占用后超时未确认/未退回，
 --                        占用登记自动失效，额度退回池里给别人用
 --  9  client             调用方名（X-Client-Id；空串表示匿名，只可能命中公共池）
+--  10 pool_pid           跨密钥共享池 ID；空串表示该密钥当前不进池（可选）
+--  11 pool_pres          预生成的池侧占用单 key；与密钥侧占用单成对超时释放（可选）
 --
 -- 返回（全部为整/字符串数组）：
 --   {1, remaining_burst, remaining_window, lease_expires_unix}        占成功
@@ -74,6 +76,8 @@ local cost            = tonumber(ARGV[6])
 local idem            = ARGV[7]
 local lease_seconds   = tonumber(ARGV[8])
 local client          = ARGV[9] or ""
+local pool_pid        = ARGV[10] or ""
+local pool_pres       = ARGV[11] or ""
 
 if not capacity or not refill_ms or not window_seconds or not window_quota
    or not cost or not lease_seconds or capacity <= 0 or refill_ms <= 0
@@ -104,7 +108,8 @@ local function ledger_add(kind, rk, cost_val, reason, late, rfields)
     "cost", tostring(cost_val),
     "reason", reason or "",
     "late", late and "1" or "0",
-    "reserve_at", tostring(rfields.reserve_at_ms or 0))
+    "reserve_at", tostring(rfields.reserve_at_ms or 0),
+    "pool_pid", pool_pid)
   local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
   local caller = rfields.caller or ""
   if caller ~= "" then
@@ -128,7 +133,7 @@ end
 local function finalize_expired(rkey)
   local f = redis.call("HMGET", rkey, "outcome", "lease_exp_ms", "cost",
                        "holds", "wholds", "caller", "idem", "pool",
-                       "reserved_at_ms")
+                       "reserved_at_ms", "pool_pid", "pool_pres")
   local fo = f[1]
   if not fo or fo ~= "" then
     return false
@@ -152,6 +157,23 @@ local function finalize_expired(rkey)
   ledger_add("release", rkey, cost_val, "timeout", false,
              {caller = f[6] or "", idem = f[7] or "", pool = f[8] or "",
               reserve_at_ms = f[9] or "0"})
+  -- 跨密钥池请求的密钥侧单子先超时：同步摘掉池侧占用，避免另一边还挂着。
+  -- 池侧 timeout 流水由 pool_reserve.lua 在从池侧发现时补；这里已经为密钥
+  -- 账本记过同一原因，不能在密钥流水上重复记。
+  local ppid = f[10] or ""
+  local ppr  = f[11] or ""
+  if ppid ~= "" and ppr ~= "" and redis.call("EXISTS", ppr) == 1 then
+    local pf = redis.call("HMGET", ppr, "outcome", "lease_exp_ms", "cost",
+                          "holds", "wholds")
+    if pf[1] == "" and (tonumber(pf[2] or "0") or 0) <= now_ms then
+      local pcost = tonumber(pf[3] or "1") or 1
+      local pmm = {}
+      for i = 1, pcost do pmm[#pmm + 1] = ppr .. "#" .. i end
+      if pf[4] and pf[4] ~= "" then redis.call("ZREM", pf[4], unpack(pmm)) end
+      if pf[5] and pf[5] ~= "" then redis.call("ZREM", pf[5], unpack(pmm)) end
+      redis.call("HSET", ppr, "outcome", "expired")
+    end
+  end
   return true
 end
 
@@ -178,7 +200,8 @@ if idem ~= "" then
       end
       -- 同一张单子继续用，绝不二次占额
       return {2, tonumber(h.lease_exp or 0), "",
-              tonumber(h.rem_burst or 0), tonumber(h.rem_window or 0)}
+              tonumber(h.rem_burst or 0), tonumber(h.rem_window or 0),
+              h.pool_pid or "", h.pool_pres or ""}
     end
     -- 占用已超约定时限还没回音：先按超时退回旧占用（留 timeout 流水，额度回池），
     -- 再以“这笔业务已了结为退回”拒绝重占。同一业务号的占、退各只有一笔，
@@ -371,6 +394,8 @@ redis.call("HSET", res_key,
   "reserved_at_ms", now_ms,
   "rem_burst", new_rem_burst,
   "rem_window", new_rem_window,
+  "pool_pid", pool_pid,
+  "pool_pres", pool_pres,
   "outcome", "")
 -- 占用流水：占成功就留一笔（与占用登记在同一原子动作里落盘）。
 -- 之后 confirm/release 由 settle.lua 各留一笔；同一业务号状态机保证

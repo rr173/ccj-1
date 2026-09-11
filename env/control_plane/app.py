@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 from typing import Optional
@@ -31,11 +32,15 @@ r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 _QUOTA_SRC = (COMMON_DIR / "quota.lua").read_text(encoding="utf-8")
 _SET_SHARE_SRC = (COMMON_DIR / "set_share.lua").read_text(encoding="utf-8")
 _REVERSE_SRC = (COMMON_DIR / "reverse.lua").read_text(encoding="utf-8")
+_POOL_QUOTA_SRC = (COMMON_DIR / "pool_quota.lua").read_text(encoding="utf-8")
+_POOL_MEMBER_SRC = (COMMON_DIR / "pool_member.lua").read_text(encoding="utf-8")
 # SHA 放在可变 dict 里：Redis 重启清空脚本缓存后由 script_runner 刷新，
 # 无需重启本进程
 _quota_sha: dict = {"sha": None}
 _set_share_sha: dict = {"sha": None}
 _reverse_sha: dict = {"sha": None}
+_pool_quota_sha: dict = {"sha": None}
+_pool_member_sha: dict = {"sha": None}
 
 
 def quota_eval(cfg_key_: str, tb_key_: str, shares_key_: str, *argv) -> tuple:
@@ -54,6 +59,22 @@ def reverse_eval(kid: str, idem: str, amount: int, note: str) -> list:
         r, _REVERSE_SRC, _reverse_sha, 3,
         [keys.cfg_key(kid), keys.reservation_key(kid, idem),
          keys.ledger_stream_key(kid), kid, idem, amount, note])
+
+
+def pool_quota_eval(pid: str, cfg: dict) -> list:
+    return run_script_sync(
+        r, _POOL_QUOTA_SRC, _pool_quota_sha, 3,
+        [keys.pool_cfg_key(pid), keys.pool_tb_key(pid), keys.pool_members_key(pid),
+         pid, cfg[keys.F_CAPACITY], cfg[keys.F_REFILL_MS],
+         cfg[keys.F_WINDOW_SECONDS], cfg[keys.F_WINDOW_QUOTA]])
+
+
+def pool_member_eval(pid: str, kid: str, action: str) -> list:
+    return run_script_sync(
+        r, _POOL_MEMBER_SRC, _pool_member_sha, 4,
+        [keys.pool_cfg_key(pid), keys.pool_members_key(pid),
+         keys.pool_membership_key(kid), keys.cfg_key(kid),
+         action, pid, kid])
 
 
 app = FastAPI(title="quota-control-plane", version="1.0.0")
@@ -85,6 +106,18 @@ class IssueRequest(BaseModel):
     burst_refill_ms: int = Field(gt=0, description="每补充 1 个令牌的毫秒数")
     window_seconds: int = Field(gt=0, le=86400, description="长周期窗口长度（秒）")
     window_quota: int = Field(gt=0, description="每个长周期窗口的总量")
+
+
+class PoolRequest(BaseModel):
+    """跨密钥共享池开池参数。池有自己独立的突发/窗口上限；成员密钥仍各算各的。"""
+    pool_id: Optional[str] = Field(default=None, min_length=1, max_length=64,
+                                   pattern=r"^[A-Za-z0-9_-]+$",
+                                   description="可选外部指定 ID；不传则随机生成")
+    name: str = Field(default="", max_length=256)
+    burst_capacity: int = Field(gt=0)
+    burst_refill_ms: int = Field(gt=0)
+    window_seconds: int = Field(gt=0, le=86400)
+    window_quota: int = Field(gt=0)
 
 
 class ShareRequest(BaseModel):
@@ -179,6 +212,169 @@ def revoke_key(kid: str) -> dict:
     return {"key_id": kid, "revoked": True}
 
 
+def _load_pool(pid: str) -> Optional[dict]:
+    try:
+        cfg = r.hgetall(keys.pool_cfg_key(pid))
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    return cfg or None
+
+
+def _pool_limits_view(cfg: dict, res: list) -> dict:
+    (state, rem_b, rem_w, held_b, held_w, win_s, refill_ms,
+     capacity, win_quota, n_members) = res
+    capacity, win_quota = int(capacity), int(win_quota)
+    rem_b, rem_w = max(0, int(rem_b)), max(0, int(rem_w))
+    held_b, held_w = max(0, int(held_b)), max(0, int(held_w))
+    stopped = state == "stopped"
+    credit_b = max(0, rem_b + held_b - capacity)
+    credit_w = max(0, rem_w + held_w - win_quota)
+    consumed_b = max(0, capacity - rem_b - held_b)
+    consumed_w = max(0, win_quota - rem_w - held_w)
+    if stopped:
+        # 停池只让 remaining（还能不能再占新的）归零，不能因此改写真用掉/冲正溢余。
+        rem_b = rem_w = 0
+    return {
+        "state": state,
+        "burst": {
+            "capacity": capacity,
+            "remaining": rem_b,
+            "held": held_b,
+            "consumed": consumed_b,
+            "reversal_credit": credit_b,
+            "refill_per_second": round(1000.0 / int(refill_ms), 3),
+        },
+        "window": {
+            "seconds": int(win_s),
+            "quota": win_quota,
+            "remaining": rem_w,
+            "held": held_w,
+            "consumed": consumed_w,
+            "reversal_credit": credit_w,
+        },
+        "member_count": int(n_members),
+    }
+
+
+@app.post("/v1/pools", status_code=201, dependencies=[Depends(require_admin)])
+def create_pool(body: PoolRequest) -> dict:
+    """开跨密钥共享额度池：写明突发上限、补充速率与窗口总量。"""
+    _retry_ping()
+    pid = body.pool_id or secrets.token_hex(16)
+    pcfg_key = keys.pool_cfg_key(pid)
+    try:
+        already = r.exists(pcfg_key)
+        if already:
+            raise HTTPException(status_code=409, detail={
+                "code": "pool_id_exists", "pool_id": pid,
+            })
+        r.hset(
+            pcfg_key,
+            mapping={
+                keys.F_NAME: body.name,
+                keys.F_STOPPED: "0",
+                keys.F_CAPACITY: body.burst_capacity,
+                keys.F_REFILL_MS: body.burst_refill_ms,
+                keys.F_WINDOW_SECONDS: body.window_seconds,
+                keys.F_WINDOW_QUOTA: body.window_quota,
+                keys.F_CREATED_AT: str(int(time.time())),
+            },
+        )
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    return {
+        "pool_id": pid,
+        "state": "active",
+        "limits": body.model_dump(exclude={"pool_id"}),
+    }
+
+
+@app.post("/v1/pools/{pid}/stop", dependencies=[Depends(require_admin)])
+def stop_pool(pid: str) -> dict:
+    """停池：成员密钥立刻不能占新的池额度；在飞单回来也不算池真用掉。"""
+    cfg = _load_pool(pid)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="pool not found")
+    try:
+        r.hset(keys.pool_cfg_key(pid), keys.F_STOPPED, "1")
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    return {"pool_id": pid, "stopped": True}
+
+
+@app.get("/v1/pools/{pid}", dependencies=[Depends(require_admin)])
+def get_pool(pid: str) -> dict:
+    """查池：剩余/在占/真用掉，以及当前在池里的密钥。"""
+    cfg = _load_pool(pid)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="pool not found")
+    try:
+        res = pool_quota_eval(pid, cfg)
+        members_raw = r.hgetall(keys.pool_members_key(pid))
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    view = _pool_limits_view(cfg, res)
+    members = [
+        {"key_id": kid, "joined_at_ms": int(joined)}
+        for kid, joined in sorted(members_raw.items(), key=lambda x: int(x[1]))
+    ]
+    return {
+        "pool_id": pid,
+        "name": cfg.get(keys.F_NAME, ""),
+        **view,
+        "keys": members,
+    }
+
+
+@app.put("/v1/pools/{pid}/keys/{kid}", dependencies=[Depends(require_admin)])
+def add_pool_key(pid: str, kid: str) -> dict:
+    """把一把有效密钥放进池。密钥已有归属且不是本池时返回 409。"""
+    if _load_pool(pid) is None:
+        raise HTTPException(status_code=404, detail="pool not found")
+    try:
+        res = pool_member_eval(pid, kid, "add")
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    if int(res[0]) != 1:
+        reason = res[1]
+        if reason == "key not found":
+            raise HTTPException(status_code=404, detail="key not found")
+        if reason == "key_revoked":
+            raise HTTPException(status_code=409, detail="key is revoked")
+        if reason == "pool_stopped":
+            raise HTTPException(status_code=409, detail="pool is stopped")
+        if reason == "already_in_pool":
+            raise HTTPException(status_code=409, detail={
+                "code": "already_in_pool",
+                "message": "key is already a member of another pool",
+                "pool_id": res[2],
+            })
+    return {"pool_id": pid, "key_id": kid, "in_pool": True,
+            "member_count": int(res[1])}
+
+
+@app.delete("/v1/pools/{pid}/keys/{kid}", dependencies=[Depends(require_admin)])
+def remove_pool_key(pid: str, kid: str) -> dict:
+    """从池中拿出密钥。新调用立即不受池限制；旧在飞单仍按原池走完。"""
+    if _load_pool(pid) is None:
+        raise HTTPException(status_code=404, detail="pool not found")
+    try:
+        res = pool_member_eval(pid, kid, "remove")
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    if int(res[0]) != 1:
+        reason = res[1]
+        if reason == "key not found":
+            raise HTTPException(status_code=404, detail="key not found")
+        if reason == "not_member":
+            raise HTTPException(status_code=404, detail="key is not in this pool")
+    return {"pool_id": pid, "key_id": kid, "in_pool": False,
+            "member_count": int(res[1])}
+
+
 @app.get("/v1/keys/{kid}/quota", dependencies=[Depends(require_admin)])
 def get_quota(kid: str) -> dict:
     """只读查看当前额度：总盘 + 公共池 + 各点名调用方份额，一次看齐。
@@ -262,6 +458,21 @@ def get_quota(kid: str) -> dict:
     total = view(capacity, win_quota, rem_b_total, rem_w_total,
                  held_b_total, held_w_total)
 
+    def _get_quota_pool_view(kid_: str) -> Optional[dict]:
+        try:
+            pool_id = r.get(keys.pool_membership_key(kid_))
+        except redis.exceptions.RedisError:
+            return None
+        if not pool_id:
+            return None
+        pcfg = _load_pool(pool_id)
+        if not pcfg:
+            return None
+        pres = pool_quota_eval(pool_id, pcfg)
+        return {"pool_id": pool_id, **_pool_limits_view(pcfg, pres)}
+
+    pool_view = _get_quota_pool_view(kid)
+
     return {
         "key_id": kid,
         "state": state,
@@ -273,6 +484,7 @@ def get_quota(kid: str) -> dict:
             "window_quota": reserved_w,
         },
         "shared_pool": pool,
+        "quota_pool": pool_view,
         "shares": shares,
     }
 
@@ -371,7 +583,8 @@ def reverse_consumption(kid: str, body: ReverseRequest) -> dict:
 
     code = int(res[0])
     if code == 1:
-        _, eid, amount_done, orig_cost, tb_ref, win_ref, pool, caller = res
+        (_, eid, amount_done, orig_cost, tb_ref, win_ref, pool, caller,
+         pool_tb_ref, pool_win_ref, pool_id) = res
         return {
             "key_id": kid,
             "reversal_id": eid,
@@ -383,6 +596,11 @@ def reverse_consumption(kid: str, body: ReverseRequest) -> dict:
                 "window": bool(int(win_ref)),
             },
             "pool": pool,
+            "pool_id": pool_id or None,
+            "pool_refunded": {
+                "burst": bool(int(pool_tb_ref or 0)),
+                "window": bool(int(pool_win_ref or 0)),
+            },
             "caller": caller or None,
             "note": body.note,
         }

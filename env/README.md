@@ -32,6 +32,7 @@
 | 对账单：占过/真用掉/退回/还占着 | `GET /v1/keys/{kid}/statement?start=&end=`：区间内 reserve/confirm/release 累计、`held_open` 还占着的单独列（不算真用掉），并把**流水侧真用掉与余量 win 计数侧真用掉**对账，对不上时 `ledger_confirmed`、`counter_consumed`、`difference` 两边数都亮出 |
 | 密钥停了流水还在、对账单还能拉 | revoke 只改 cfg.revoked，不碰 Stream/索引；ledger/statement 对 revoked 密钥照常返回；重启后流水随 AOF(appendfsync always) 落盘不丢，两端无需重启自动自愈 |
 | 冲正已真用掉的一笔 | `POST /v1/keys/{kid}/reversals`，`reverse.lua` 原子完成：只能冲**有效密钥**上、**已调成**的那一笔（写明业务号 + 数量）；一笔业务号只能冲一次（重复提交幂等回原结论），冲的数量不能超过那笔当时真用掉的；冲回的量立刻退回原池令牌桶/原窗口桶，**立刻能再占**；冲正自己在只追加流水上留一笔 `reversal`，之后不能改。密钥停用后拒绝新冲正，已冲过的流水/对账单仍可翻 |
+| 多把有效密钥共用一个跨密钥额度池 | `POST /v1/pools` 开池并写明突发/窗口上限；`PUT/DELETE /v1/pools/{pid}/keys/{kid}` 放入/拿出密钥。数据面每次占用必须同时占住“密钥自己的额度”和“池聚合额度”；任一边占不住即拒绝并给 Retry-After。`GET /v1/pools/{pid}` 查池剩余/在池密钥/还占着/真用掉，密钥余量接口也带 `quota_pool` |
 | Docker 部署 | `docker compose up -d --build`，含 Redis（持久化卷）、控制面、数据面、模拟上游 |
 
 ## 架构
@@ -170,6 +171,7 @@ X-Retry-After-Ms: 400
 长窗口）、`key_revoked`（403）、`invalid_api_key`（401）、
 `missing_api_key`（401）、`quota_store_unavailable`（503，记额度层
 重启/不可用，带 `Retry-After: 2`，Redis 恢复后自动自愈、无需重启两端）、
+`pool_stopped`（403，跨密钥共享池已停，新占用和在飞确认都不算）、
 `upstream_unavailable`（502，这次没调成，**占着的额度已退回**）、
 `idempotent_replay_confirmed` / `idempotent_replay_released` /
 `idempotent_replay_timeout`（409，同一业务号重放：已确认 / 已退回 /
@@ -328,24 +330,28 @@ curl -s -X POST localhost:8000/v1/keys/<kid>/reversals \
    对外的占用/确认，代价是每次约 0.1~1ms 磁盘同步）；吞吐优先可改
    `everysec`，崩溃窗口 ≤1s 且只可能丢“尚未返回给调用方”的占用。已关闭
    RDB 快照，避免旧 dump 与 AOF 混用造成计数回退。
-3. **回音时限**：`RESERVATION_TTL_SECONDS` 必须大于上游调用的总超时
+3. **Redis 部署形态**：当前同一把密钥的脚本同 slot，可水平分片；跨密钥共享池的
+   Lua 会同时访问 `{qk:<kid>}` 与 `{qp:<pid>}`，因此该能力适用于单机/主从
+   Redis。Redis Cluster 部署若要启用共享池，应先把池归属与配对占用调整为同
+   slot 数据模型，或改为带补偿的两阶段事务协调。
+4. **回音时限**：`RESERVATION_TTL_SECONDS` 必须大于上游调用的总超时
    （默认 60s vs 数据面上游超时 30s）。调小了，慢上游的占用会被提前退回，
    迟到的确认仍会计账（总量可能短暂超出）；调大了，崩溃残留的占用退回
    变慢。占用登记与占用单都带 TTL，不会泄漏。
-4. **脚本缓存与重连**：两端启动时 `SCRIPT LOAD`，运行期 Redis 重启导致
+5. **脚本缓存与重连**：两端启动时 `SCRIPT LOAD`，运行期 Redis 重启导致
    `NOSCRIPT` 时由 `common/script_runner.py` 自动重载并刷新 SHA；连接
    拒绝/`LOADING`/`READONLY` 指数退避重试。因此升级或重启 Redis 后无需
    重启任何一面。
-5. **管理员鉴权**：`ADMIN_TOKEN` 换成正式 IAM/JWT；管理口走内网或 mTLS。
-6. **密钥元数据**：当前密钥列表用 `SCAN cfg:*`。密钥量级很大或需要
+6. **管理员鉴权**：`ADMIN_TOKEN` 换成正式 IAM/JWT；管理口走内网或 mTLS。
+7. **密钥元数据**：当前密钥列表用 `SCAN cfg:*`。密钥量级很大或需要
    审计/多版本配置时，控制面加 PostgreSQL 作为元数据 SoR，但**计数事实
    仍以 Redis 为准**（对账时以 `win/tb` 计数覆盖元数据中的派生值）。
-7. **数据面扩缩**：无状态，直接加多副本；上游地址用 `UPSTREAM_URL`
+8. **数据面扩缩**：无状态，直接加多副本；上游地址用 `UPSTREAM_URL`
    配置，代理默认透传 query/path/header（剔除 hop-by-hop 与密钥头）。
-8. **可观测**：建议数据面对 `burst_limited/window_limited/revoked/
+9. **可观测**：建议数据面对 `burst_limited/window_limited/revoked/
    quota_store_unavailable/upstream_unavailable` 与占用超时退回打点上报
    Prometheus（本仓库为聚焦核心未包含）。
-9. **流水增长**：`ledger` Stream 与调用方/业务号索引只追加、不设 TTL、
+10. **流水增长**：`ledger` Stream 与调用方/业务号索引只追加、不设 TTL、
    不裁剪（“留下之后不能改”的硬要求）。长期运行需要在 Redis 之外做归档：
    用 `XRANGE`/`XREAD` 增量消费（entry id 即毫秒时间戳，天然支持断点续传），
    落到对象存储/数仓后再按合规期限决定是否离线保存；在线 Stream 的裁剪必须
@@ -368,7 +374,10 @@ common/               两端共享的协议（构建时各自打进镜像）
   quota.lua           控制面：只读余量查询（总盘+公共池+各份额，
                       每个视角都有 可再占/还占着/真用掉/冲正溢余），口径与 reserve 一致
   set_share.lua       控制面：原子校验“Σ份额 ≤ 总量”并写入份额表
-  keys.py             key 规则、hash、配置字段（含 ledger Stream/索引规则）
+  pool_reserve.lua    数据面：跨密钥共享池的第二道原子占用（密钥+池两边都占住）
+  pool_member.lua     控制面：密钥入池/出池，原子保证一把密钥只在一个池
+  pool_quota.lua      控制面：只读共享池聚合余量/在占/成员数
+  keys.py             key 规则、hash、配置字段（含 ledger/共享池规则）
   script_runner.py    NOSCRIPT 自动重载 + 连接/LOADING/READONLY 退避重试
 control_plane/        FastAPI：签发/停用/列表/查余量/设份额/冲正/翻流水/拉对账单
   ledger.py           占用流水查询（按密钥+调用方/业务号/时间段）与对账单聚合
@@ -401,3 +410,52 @@ demo/e2e_demo.py      端到端自检
   份额（409）；份额配置保留，余量查询照常返回口径。
 - 取消份额（`DELETE`）后预留立即回到公共池；该调用方已发生的扣减计数原样
   保留（有 TTL 自然过期），不回写、不补偿。
+
+## 跨密钥共享额度池
+
+当多把还有效的密钥要受同一个总额度约束时，开一个共享池。池不是替代密钥自己的
+限额，而是额外的一道聚合闸门：成员密钥仍各用各的令牌桶/窗口，只有
+**密钥自己占得住、池也同时占得住** 才能放行。
+
+```bash
+# 1) 开池：突发上限、补充速率、窗口长度、窗口总量都写明
+curl -s -X POST localhost:8000/v1/pools \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"name":"partner-pool","burst_capacity":10,"burst_refill_ms":1000,
+       "window_seconds":60,"window_quota":100}'
+# -> {"pool_id":"...", "state":"active", ...}
+
+# 2) 把指定密钥放入池（一次只能在一个池里；已在别的池返回 409）
+curl -s -X PUT localhost:8000/v1/pools/<pid>/keys/<kid> -H "Authorization: Bearer $ADMIN"
+
+# 3) 查池：还能再占多少、在池密钥、多少还占着、多少已真用掉
+curl -s localhost:8000/v1/pools/<pid> -H "Authorization: Bearer $ADMIN"
+
+# 4) 拿出密钥：新调用立即不受该池限制；拿出前已占着的旧单仍按原池走完
+curl -s -X DELETE localhost:8000/v1/pools/<pid>/keys/<kid> -H "Authorization: Bearer $ADMIN"
+
+# 5) 停池：成员密钥立刻不能占新的池额度；在飞单回来也不算池真用掉
+curl -s -X POST localhost:8000/v1/pools/<pid>/stop -H "Authorization: Bearer $ADMIN"
+```
+
+硬规则：
+
+- **放入/拿出都点名密钥**：`PUT/DELETE /v1/pools/{pid}/keys/{kid}`。归属以
+  `{qk:<kid>}pool` 为唯一事实；同一把密钥同时只能在一个池里，重复放入别的池
+  返回 409 `already_in_pool`。没进池的密钥完全不受池影响。
+- **双重占用**：数据面先占密钥侧单，再占池侧单。池满时即使密钥自己还有额度，
+  也返回 `burst_limited` / `window_limited` 和 Retry-After；刚占的密钥侧额度会
+  立即释放。两张单子用同一个业务号关联，业务号重放不会二次占额。
+- **出池不影响旧在飞单**：删除归属只阻止新请求选这个池；旧占用单上记录了
+  原 `pool_pid/pool_pres`，confirm/release 仍操作原池，直到这笔正常调成或退回。
+- **停池语义**：`stopped=1` 后新池占用立即拒绝（`403 pool_stopped`）；已经占着、
+  上游之后才回来的，settle 原子释放两边占用并返回 `403 pool_stopped`，不计入
+  池真用掉。密钥自己若仍有效，该笔的失败仍按一次未调成调用处理，不产生确认。
+- **超时兜底**：池侧 `{qp:<pid>}holds/wholds` 与密钥侧 holds 都由 sweep 扫描；
+  配对的两张单任一先超时，会摘掉另一边已到期的登记，避免池额度挂死。
+- **冲正**：对成员密钥上已确认的一笔冲正时，reverse.lua 同时把密钥原计数器和
+  池聚合计数器各退回一笔；响应中的 `pool_refunded` 标明池两个维度是否有账可退。
+
+> 当前实现的跨密钥 Lua 会访问 `{qk:<kid>}` 与 `{qp:<pid>}` 两类 hash tag，适用
+> 于 docker-compose 使用的单机 Redis；Redis Cluster 要求单脚本同 slot，需要改成
+> 外部两阶段协调或将池归属/计数重新设计为同 slot 键。

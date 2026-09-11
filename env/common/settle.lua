@@ -72,6 +72,9 @@ end
 local cost         = tonumber(h.cost or "1")
 local holds_key    = h.holds
 local wholds_key   = h.wholds
+local pool_pid     = h.pool_pid or ""
+local pool_pres    = h.pool_pres or ""
+local pcfg_key     = pool_pid ~= "" and ("{qp:" .. pool_pid .. "}cfg") or ""
 local SCALE        = 1000
 
 -- 占用流水只追加：XADD per-key Stream（entry id 即 Redis 毫秒时间戳），
@@ -86,7 +89,8 @@ local function ledger_add(kind, reason, late)
     "cost", tostring(cost),
     "reason", reason or "",
     "late", late and "1" or "0",
-    "reserve_at", tostring(h.reserved_at_ms or 0))
+    "reserve_at", tostring(h.reserved_at_ms or 0),
+    "pool_pid", pool_pid)
   local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
   local caller = h.caller or ""
   if caller ~= "" then
@@ -96,6 +100,77 @@ local function ledger_add(kind, reason, late)
   if idem ~= "" then
     redis.call("ZADD", "{qk:" .. kid .. "}lii:" .. redis.sha1hex(idem), score, eid)
   end
+end
+
+local function remove_holds(target_holds, target_wholds, rkey, cost_val)
+  local mm = {}
+  for i = 1, cost_val do mm[#mm + 1] = rkey .. "#" .. i end
+  if target_holds and target_holds ~= "" then
+    redis.call("ZREM", target_holds, unpack(mm))
+  end
+  if target_wholds and target_wholds ~= "" then
+    redis.call("ZREM", target_wholds, unpack(mm))
+  end
+end
+
+-- 读写池侧配对单。池侧没有独立流水；它只负责聚合配额，事实流水仍写在密钥账本。
+local function pool_pair()
+  if pool_pid == "" or pool_pres == "" or redis.call("EXISTS", pool_pres) == 0 then
+    return nil
+  end
+  local flat = redis.call("HGETALL", pool_pres)
+  local ph = {}
+  for i = 1, #flat, 2 do ph[flat[i]] = flat[i + 1] end
+  return ph
+end
+
+local function settle_pool_confirm(ph)
+  local pcost = tonumber(ph.cost or h.cost or "1") or cost
+  remove_holds(ph.holds, ph.wholds, pool_pres, pcost)
+
+  local tb = ph.tb
+  local cap = tonumber(ph.cap or "0")
+  local refill = tonumber(ph.refill_ms or "0")
+  if tb and tb ~= "" and cap > 0 and refill > 0 then
+    local tokens
+    if redis.call("EXISTS", tb) == 0 then
+      tokens = cap * SCALE
+    else
+      local old_tokens = tonumber(redis.call("HGET", tb, "tokens"))
+      local old_ts = tonumber(redis.call("HGET", tb, "ts"))
+      if not old_tokens or not old_ts then
+        tokens = cap * SCALE
+      else
+        local elapsed = now_us - old_ts
+        if elapsed < 0 then elapsed = 0 end
+        local refilled = math.floor((elapsed / 1000) * SCALE / refill)
+        tokens = math.min(cap * SCALE, old_tokens + refilled)
+      end
+    end
+    tokens = tokens - pcost * SCALE
+    redis.call("HSET", tb, "tokens", tokens, "ts", now_us)
+    local full_ms = math.ceil((cap * SCALE - tokens) * refill / SCALE) + 5000
+    if full_ms < 5000 then full_ms = 5000 end
+    redis.call("PEXPIRE", tb, full_ms)
+  end
+
+  local prefix = ph.win_prefix
+  local pwin = tonumber(ph.win_seconds or "0")
+  if prefix and prefix ~= "" and pwin > 0 then
+    local pwin_ms = pwin * 1000
+    local idx = math.floor(now_ms / pwin_ms)
+    local cbucket = prefix .. pwin .. ":" .. idx
+    redis.call("INCRBY", cbucket, pcost)
+    redis.call("PEXPIRE", cbucket, pwin_ms * 2 + 5000)
+    redis.call("HSET", pool_pres, "cbucket", cbucket)
+  end
+  redis.call("HSET", pool_pres, "outcome", "confirmed")
+end
+
+local function settle_pool_release(ph)
+  local pcost = tonumber(ph.cost or h.cost or "1") or cost
+  remove_holds(ph.holds, ph.wholds, pool_pres, pcost)
+  redis.call("HSET", pool_pres, "outcome", "released")
 end
 
 -- 终态幂等：confirmed/released 只回原结论；expired 单子收到 release 也在此
@@ -122,6 +197,22 @@ if action == "confirm" then
   end
   if redis.call("HGET", cfg_key, "revoked") == "1" then
     return {0, "revoked"}
+  end
+
+  local ph_confirm = pool_pair()
+  if pool_pid ~= "" then
+    local pool_alive = ph_confirm ~= nil
+      and redis.call("EXISTS", pcfg_key) == 1
+      and redis.call("HGET", pcfg_key, "stopped") ~= "1"
+    if not pool_alive then
+      -- 池停了：在飞调用回来也不能算池真用掉。原子摘掉两边占用，密钥侧记
+      -- release/pool_stopped；调用方收到明确失败，不能把上游应答当成功配额消耗。
+      remove_holds(holds_key, wholds_key, res_key, cost)
+      if ph_confirm then settle_pool_release(ph_confirm) end
+      redis.call("HSET", res_key, "outcome", "released")
+      ledger_add("release", "pool_stopped", false)
+      return {0, "pool_stopped"}
+    end
   end
 
   -- 占用登记作废（若已随回音时限过期被清掉，ZREM 为空操作，无副作用）
@@ -178,6 +269,17 @@ if action == "confirm" then
     redis.call("HSET", res_key, "cbucket", cur_key)
   end
 
+  if pool_pid ~= "" and ph_confirm then
+    settle_pool_confirm(ph_confirm)
+    local pool_cbucket = redis.call("HGET", pool_pres, "cbucket") or ""
+    redis.call("HMSET", res_key,
+      "pool_tb", ph_confirm.tb or "",
+      "pool_cap", ph_confirm.cap or "",
+      "pool_refill_ms", ph_confirm.refill_ms or "",
+      "pool_win_seconds", ph_confirm.win_seconds or "",
+      "pool_cbucket", pool_cbucket)
+  end
+
   redis.call("HSET", res_key, "outcome", "confirmed")
   -- 流水留一笔 confirm（迟到的真调用标 late=1）；真用掉以此为唯一口径，
   -- 与令牌桶/窗口的真扣在同一原子动作里，对账单据此与余量侧真用掉对账。
@@ -202,6 +304,11 @@ if holds_key and holds_key ~= "" then
 end
 if wholds_key and wholds_key ~= "" then
   redis.call("ZREM", wholds_key, unpack(members))
+end
+
+local ph_release = pool_pair()
+if pool_pid ~= "" and ph_release then
+  settle_pool_release(ph_release)
 end
 
 redis.call("HSET", res_key, "outcome", "released")

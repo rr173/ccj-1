@@ -42,7 +42,7 @@
 --
 -- 返回：
 --   {1, reversal_eid, amount, confirmed_cost, tb_refunded, win_refunded,
---    pool, caller}                                    冲正成功
+--    pool, caller, pool_burst_refunded, pool_window_refunded, pool_pid}  冲正成功
 --        tb_refunded/win_refunded 为 1 表示该维度计数还在、额度已退回，
 --        为 0 表示该维度已老化、无账可退（不是错误）
 --   {2, reversal_eid, amount, confirmed_cost}         这笔业务已经冲过（幂等重放）
@@ -227,6 +227,55 @@ if win_seconds and win_seconds > 0 then
   end
 end
 
+-- 跨密钥池：如果原确认带 pool_pid，同步把聚合池真用掉的那一笔记回池计数器。
+-- 密钥有效但池已停时，原池口径仍可退款；池配置缺失/已老化的维度按无账可退。
+local resv_pool_pid = rh["pool_pid"] or conf.f["pool_pid"] or ""
+if resv_pool_pid ~= "" then
+  pool_pid = resv_pool_pid
+  local pcfg = "{qp:" .. pool_pid .. "}cfg"
+  local ptb = "{qp:" .. pool_pid .. "}tb"
+  local pcap = tonumber(redis.call("HGET", pcfg, "burst_capacity"))
+  local pref = tonumber(redis.call("HGET", pcfg, "burst_refill_ms"))
+  if pcap and pref and redis.call("EXISTS", ptb) == 1 then
+    local ptokens
+    local pold = tonumber(redis.call("HGET", ptb, "tokens"))
+    local pts = tonumber(redis.call("HGET", ptb, "ts"))
+    if not pold or not pts then
+      ptokens = pcap * SCALE
+    elseif pold >= pcap * SCALE then
+      ptokens = pold
+    else
+      local pelapsed = now_us - pts
+      if pelapsed < 0 then pelapsed = 0 end
+      ptokens = math.min(pcap * SCALE,
+        pold + math.floor((pelapsed / 1000) * SCALE / pref))
+    end
+    ptokens = ptokens + amount * SCALE
+    redis.call("HSET", ptb, "tokens", ptokens, "ts", now_us)
+    local pttl = math.ceil((pcap * SCALE - ptokens) * pref / SCALE) + 5000
+    if pttl < 5000 then pttl = 5000 end
+    if ptokens > pcap * SCALE then pttl = math.max(pttl, 86400000) end
+    redis.call("PEXPIRE", ptb, pttl)
+    pool_burst_refunded = 1
+  end
+
+  local pwin = tonumber(rh["pool_win_seconds"])
+  local pcb = rh["pool_cbucket"]
+  if not pwin then
+    pwin = tonumber(redis.call("HGET", pcfg, "window_seconds"))
+  end
+  if (not pcb or pcb == "") and pwin then
+    local cut = string.find(conf.eid, "-", 1, true)
+    local cms = tonumber(string.sub(conf.eid, 1, cut - 1)) or now_ms
+    pcb = "{qp:" .. pool_pid .. "}win:" .. pwin .. ":"
+      .. math.floor(cms / (pwin * 1000))
+  end
+  if pcb and pcb ~= "" and redis.call("EXISTS", pcb) == 1 then
+    redis.call("INCRBY", pcb, -amount)
+    pool_window_refunded = 1
+  end
+end
+
 -- ── 冲正自己留一笔：与上面的计数退回同一原子动作 ──────────────────────────
 local reserve_at = "0"
 if resv then
@@ -245,7 +294,8 @@ local reversal_eid = redis.call("XADD", ledger_key, "*",
   "late", "0",
   "reserve_at", reserve_at,
   "of", tostring(cost),
-  "note", note)
+  "note", note,
+  "pool_pid", pool_pid)
 local score = tonumber(string.sub(reversal_eid, 1,
   string.find(reversal_eid, "-") - 1)) or now_ms
 if caller ~= "" then
@@ -259,7 +309,11 @@ if #res_flat > 0 then
   redis.call("HSET", res_key,
     "rev_amount", amount,
     "rev_at_ms", now_ms,
-    "rev_eid", reversal_eid)
+    "rev_eid", reversal_eid,
+    "pool_pid", pool_pid,
+    "pool_rev_burst", pool_burst_refunded,
+    "pool_rev_window", pool_window_refunded)
 end
 
-return {1, reversal_eid, amount, cost, tb_refunded, win_refunded, pool, caller}
+return {1, reversal_eid, amount, cost, tb_refunded, win_refunded, pool, caller,
+        pool_burst_refunded, pool_window_refunded, pool_pid}

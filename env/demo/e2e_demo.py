@@ -118,6 +118,36 @@ def revoke(kid: str):
                 {"Authorization": f"Bearer {ADMIN}"})
 
 
+def create_pool(burst: int, refill_ms: int, win_s: int, win_q: int,
+                name: str = "e2e-pool"):
+    return http("POST", f"{CP}/v1/pools",
+                {"Authorization": f"Bearer {ADMIN}"},
+                {"name": name, "burst_capacity": burst,
+                 "burst_refill_ms": refill_ms, "window_seconds": win_s,
+                 "window_quota": win_q})
+
+
+def pool_view(pid: str):
+    _, _, body = http("GET", f"{CP}/v1/pools/{pid}",
+                      {"Authorization": f"Bearer {ADMIN}"})
+    return body
+
+
+def pool_add(pid: str, kid: str):
+    return http("PUT", f"{CP}/v1/pools/{pid}/keys/{kid}",
+                {"Authorization": f"Bearer {ADMIN}"})
+
+
+def pool_remove(pid: str, kid: str):
+    return http("DELETE", f"{CP}/v1/pools/{pid}/keys/{kid}",
+                {"Authorization": f"Bearer {ADMIN}"})
+
+
+def pool_stop(pid: str):
+    return http("POST", f"{CP}/v1/pools/{pid}/stop",
+                {"Authorization": f"Bearer {ADMIN}"})
+
+
 def wait_healthy() -> None:
     for base, plane in ((CP, "control"), (DP, "data")):
         for _ in range(60):
@@ -833,6 +863,84 @@ def t_reversal() -> None:
            "alice 冲正后恰好 2 个")
 
 
+def t_quota_pool() -> None:
+    print("\n=== 12) 跨密钥共享额度池 ===")
+    sp, _, sb = create_pool(burst=1, refill_ms=100000, win_s=300, win_q=1)
+    pid = sb["pool_id"]
+    record("开池写明突发和窗口上限并返回 active", sp == 201 and sb["state"] == "active",
+           f"{sp} {sb}")
+
+    ka, key_a = issue_key("pool-A", burst=10, refill_ms=100000, win_s=300, win_q=10)
+    kb, key_b = issue_key("pool-B", burst=10, refill_ms=100000, win_s=300, win_q=10)
+    sa, _, ba = pool_add(pid, ka)
+    sb2, _, bb = pool_add(pid, kb)
+    record("放入两把密钥都点名 key_id，成员数正确",
+           sa == 200 and sb2 == 200 and ba["member_count"] == 2
+           and bb["member_count"] == 2, f"{ba} {bb}")
+
+    s1, _, _ = call_dp(key_a, idem="P-A1")
+    s2, _, b2 = call_dp(key_b, idem="P-B1")
+    pv = pool_view(pid)
+    record("池满后，即使 B 自己还有额度也不能占，并告知等待时间",
+           s1 == 200 and s2 == 429
+           and b2["error"]["code"] == "burst_limited"
+           and b2["error"]["retry_after_ms"] > 0
+           and b2["remaining_burst"] == 0,
+           f"{s1}/{s2} {b2.get('error')}")
+    record("可查池剩余/成员/在占/真用掉：1 笔已真用掉，成员 2 把",
+           pv["burst"]["remaining"] == 0 and pv["burst"]["held"] == 0
+           and pv["burst"]["consumed"] == 1 and len(pv["keys"]) == 2,
+           json.dumps(pv, ensure_ascii=False))
+    record("成员密钥自己的余量视图能看到所属池",
+           quota(ka)["quota_pool"]["pool_id"] == pid
+           and quota(ka)["quota_pool"]["burst"]["consumed"] == 1, "")
+
+    other, _, other_body = create_pool(burst=2, refill_ms=100000,
+                                       win_s=300, win_q=2, name="other")
+    sdup, _, dup = pool_add(other_body["pool_id"], ka)
+    record("一把密钥同时只能待在一个池（重复入池 409 already_in_pool）",
+           other == 201 and sdup == 409
+           and dup["detail"]["code"] == "already_in_pool"
+           and dup["detail"]["pool_id"] == pid, f"{sdup} {dup}")
+
+    sr, _, _ = pool_remove(pid, ka)
+    s3, _, _ = call_dp(key_a, idem="P-A-out")
+    pv2 = pool_view(pid)
+    record("拿出 A 后，A 的新调用不受池限制；池仍保持原来的 1 笔真用掉",
+           sr == 200 and s3 == 200 and pv2["burst"]["consumed"] == 1
+           and {x["key_id"] for x in pv2["keys"]} == {kb},
+           f"{sr}/{s3} pool={pv2['burst']}")
+
+    # 停池发生在在飞调用期间：新占用立即拒绝；回来的旧调用也不算池真用掉。
+    stop_pool, _, stop_key = create_pool(burst=1, refill_ms=100000,
+                                         win_s=300, win_q=1, name="stop-pool")
+    spid = stop_key["pool_id"]
+    kd, key_d = issue_key("pool-stop", burst=10, refill_ms=100000,
+                          win_s=300, win_q=10)
+    pool_add(spid, kd)
+    done: list = []
+
+    def slow_pool_call():
+        done.append(call_dp(key_d, idem="P-slow", path="/slow?ms=1200"))
+
+    th = threading.Thread(target=slow_pool_call)
+    th.start()
+    time.sleep(0.4)
+    held = pool_view(spid)
+    pool_stop(spid)
+    s_new, _, new_body = call_dp(key_d, idem="P-new")
+    th.join()
+    pv3 = pool_view(spid)
+    record("停池后新占用立即 403；在飞回来也不算真用掉",
+           held["burst"]["held"] == 1 and s_new == 403
+           and new_body["error"]["code"] == "pool_stopped"
+           and done[0][0] == 403 and done[0][2]["error"]["code"] == "pool_stopped"
+           and pv3["state"] == "stopped"
+           and pv3["burst"]["held"] == 0 and pv3["burst"]["consumed"] == 0,
+           f"new={s_new}, call={done}, pool={json.dumps(pv3['burst'], ensure_ascii=False)}")
+
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--restart", action="store_true",
@@ -849,6 +957,7 @@ def main() -> None:
     t_auth_and_revoke()
     t_shares()
     t_ledger_and_statement()
+    t_quota_pool()
     t_reversal()
     if args.restart:
         compose = str(Path(__file__).resolve().parent.parent / "docker-compose.yml")

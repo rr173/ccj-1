@@ -58,6 +58,7 @@ def _parse_event(eid: str, fields: dict, kid: str) -> dict:
         "caller": fields.get("caller", ""),
         "idem_key": fields.get("idem", ""),
         "pool": fields.get("pool", ""),
+        "quota_pool_id": fields.get("pool_pid", ""),
         "cost": int(fields.get("cost", "1") or "1"),
         "reason": fields.get("reason", ""),
         "late": fields.get("late", "0") == "1",
