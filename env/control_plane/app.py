@@ -319,8 +319,9 @@ def rotate_key(kid: str, body: RotateRequest) -> dict:
 
     换的是认证明文，不是配额身份——已真用掉不清零，突发/窗口不重填，
     新旧明文在宽限期内吃同一份突发/窗口（见 README“密钥换新”）。
-    上一档换新说好的宽限时间还没到（且旧明文没被提前收掉）时返回 409
-    rotation_in_grace；密钥停用/不存在同样拒绝。
+    上一档换新说好的宽限时间还没到时返回 409 rotation_in_grace；
+    提前收掉旧明文（retire）不缩短这段时间，只有宽限自然到期才能再换。
+    密钥停用/不存在同样拒绝。
     """
     cfg = _load_config(kid)
     if cfg is None:
@@ -345,9 +346,10 @@ def rotate_key(kid: str, body: RotateRequest) -> dict:
             raise HTTPException(status_code=409, detail={
                 "code": "rotation_in_grace",
                 "message": "previous rotation's grace period has not ended; "
-                           "wait it out or retire the old plaintext early",
+                           "retiring the old plaintext early does not shorten it",
                 "previous_key_id": res[2],
                 "grace_until_ms": int(res[3]),
+                "previous_state": res[4] if len(res) > 4 else "active",
             })
         if reason == "credential_in_use":
             raise HTTPException(status_code=409, detail={

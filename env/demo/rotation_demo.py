@@ -13,7 +13,8 @@
   6. 宽限没到可提前收掉旧明文；收掉后旧的不能再占；在飞的还能结完
   7. 密钥停了，新旧明文都不能再占新的
   8. 没换过新的只认签发时那一把（出示别的哈希当无效）
-  9. 上一档换新的宽限没到，不能再换一次；收掉旧的以后可以接着换
+  9. 上一档换新的宽限没到，不能再换一次（提前收掉旧明文也不能缩短约定时间）；
+     宽限自然到期后才能再换
  10. 用旧明文占过的业务号，换新明文再来不能当成另一笔（同一占用单 409）
 """
 from __future__ import annotations
@@ -235,12 +236,14 @@ def main() -> int:
     s, _, b = retire(k2)
     record("重复收掉幂等 200 already_inactive", s == 200
            and b.get("already_inactive") is True, str(b))
-    # 收掉旧的以后可以立刻再换
+    # 提前收掉不缩短约定时间：说好的宽限没走完，仍不能再换（即便旧的已收）
     s, _, b = rotate(k2, 10)
-    record("收掉旧的以后上一档虽未到期也能再换", s == 201, str(b))
-    s, _, _ = call(k2_new, "retired-then-rotate-prev")
-    # k2_new 在第二次 rotate 后成为上一版（active 宽限），仍可用
-    record("再换后上一版（收掉发生之前的当前）宽限内可用", s == 200, f"status={s}")
+    record("收掉旧的以后宽限没走完仍不能再换 409", s == 409
+           and b["detail"]["code"] == "rotation_in_grace"
+           and b["detail"]["previous_state"] == "retired", str(b))
+    # 收掉只是不能占新的：当前明文不受影响，照常可用
+    s, _, _ = call(k2_new, "retired-then-current-ok")
+    record("收掉上一版后当前明文照常可用", s == 200, f"status={s}")
 
     # ── 7) 密钥停了：新旧都不能再占 ──────────────────────────────────
     s, _, _ = revoke(k2)

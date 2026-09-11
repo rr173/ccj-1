@@ -10,8 +10,9 @@
 --
 -- 硬规则（全部在 Redis 单线程同一段脚本内原子保证）：
 --   1. 只能给存在、未停用的密钥换新；
---   2. 上一档换新说好的宽限时间还没到，不能再换一次（上一版还在 active）；
---      宽限自然到期、或上一版已被提前收掉（retired）后，才允许再换；
+--   2. 上一档换新说好的宽限时间还没到，不能再换一次——只认约定时间
+--      （grace_until_ms），提前收掉旧明文（retire）只是让旧的不能再占新的，
+--      绝不缩短、跳过这段约定时间；宽限自然到期后才允许再换；
 --   3. 换新绝不清零已真用掉、绝不重填突发/窗口——本脚本不碰任何计数 key；
 --   4. 新旧明文吃同一份突发/窗口：别名只做“认证明文 → 逻辑 kid”的解析，
 --      占用/确认/退回全部仍在逻辑 kid 名下的同一批计数与占用登记上；
@@ -30,8 +31,10 @@
 --   {1, current_cred, prev_cred, grace_until_ms, rotated_at_ms}  换新成功
 --   {0, "key not found"}
 --   {0, "revoked"}                    密钥已停用
---   {0, "grace_active", prev_cred, grace_until_ms}
+--   {0, "grace_active", prev_cred, grace_until_ms, prev_state}
 --                                    上一档换新的宽限时间还没到，不能再换
+--                                    （prev_state 为 active/retired：是否已提前
+--                                    收掉旧明文不影响这道门）
 --   {0, "credential_in_use", cred}   新明文哈希已被别的（或这把）密钥登记
 --   {0, "bad arguments"}
 
@@ -69,14 +72,15 @@ end
 local t      = redis.call("TIME")
 local now_ms = t[1] * 1000 + math.floor(t[2] / 1000)
 
--- 上一档换新还在宽限（上一版仍是 active 且说好的时间没到）：不能再换。
--- 提前收掉（prev_state=retired）后即使时间没到也允许换；宽限自然到期后
--- （grace_until_ms <= now）也允许换——旧别名保留，只是数据面不再认它占新的。
+-- 上一档换新还在宽限（说好的时间没到）：不能再换。
+-- 提前收掉旧明文（prev_state=retired）只让旧的不能再占新的，不缩短约定的
+-- 宽限时间——能不能再换新只看 grace_until_ms，与是否收掉无关。宽限自然到期
+-- （grace_until_ms <= now）后旧别名保留、数据面不再认它占新的，才能再换。
 local prev_cred       = redis.call("HGET", rstat_key, "prev") or ""
 local grace_until     = tonumber(redis.call("HGET", rstat_key, "grace_until_ms") or "0") or 0
 local prev_state      = redis.call("HGET", rstat_key, "prev_state") or ""
-if prev_cred ~= "" and prev_state ~= "retired" and grace_until > now_ms then
-  return {0, "grace_active", prev_cred, grace_until}
+if prev_cred ~= "" and grace_until > now_ms then
+  return {0, "grace_active", prev_cred, grace_until, prev_state}
 end
 
 -- 当前明文是谁：从没换过就是签发时那把（kid 本身）；换过就是 rstat.current。
