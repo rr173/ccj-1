@@ -173,6 +173,9 @@ if action == "confirm" then
     local cur_key = win_prefix .. win_seconds .. ":" .. cur_idx
     redis.call("INCRBY", cur_key, cost)
     redis.call("PEXPIRE", cur_key, win_ms * 2 + 5000)
+    -- 记下这笔确认落进的窗口桶 key：冲正（reverse.lua）要把冲回的量
+    -- 从【同一个桶】扣掉，不能按冲正时刻落到新桶，否则跨桶账就对不平。
+    redis.call("HSET", res_key, "cbucket", cur_key)
   end
 
   redis.call("HSET", res_key, "outcome", "confirmed")

@@ -30,10 +30,12 @@ COMMON_DIR = Path(__file__).resolve().parent.parent / "common"
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 _QUOTA_SRC = (COMMON_DIR / "quota.lua").read_text(encoding="utf-8")
 _SET_SHARE_SRC = (COMMON_DIR / "set_share.lua").read_text(encoding="utf-8")
+_REVERSE_SRC = (COMMON_DIR / "reverse.lua").read_text(encoding="utf-8")
 # SHA 放在可变 dict 里：Redis 重启清空脚本缓存后由 script_runner 刷新，
 # 无需重启本进程
 _quota_sha: dict = {"sha": None}
 _set_share_sha: dict = {"sha": None}
+_reverse_sha: dict = {"sha": None}
 
 
 def quota_eval(cfg_key_: str, tb_key_: str, shares_key_: str, *argv) -> tuple:
@@ -44,6 +46,14 @@ def quota_eval(cfg_key_: str, tb_key_: str, shares_key_: str, *argv) -> tuple:
 def set_share_eval(cfg_key_: str, shares_key_: str, caller: str, share_json: str) -> list:
     return run_script_sync(r, _SET_SHARE_SRC, _set_share_sha, 2,
                            [cfg_key_, shares_key_, caller, share_json])
+
+
+def reverse_eval(kid: str, idem: str, amount: int, note: str) -> list:
+    """冲正一笔已调成的真用掉（reverse.lua 原子完成校验/退回/留笔）。"""
+    return run_script_sync(
+        r, _REVERSE_SRC, _reverse_sha, 3,
+        [keys.cfg_key(kid), keys.reservation_key(kid, idem),
+         keys.ledger_stream_key(kid), kid, idem, amount, note])
 
 
 app = FastAPI(title="quota-control-plane", version="1.0.0")
@@ -82,6 +92,19 @@ class ShareRequest(BaseModel):
     补充速率与窗口长度沿用密钥配置（份额只是总量里的一截）。"""
     burst_capacity: int = Field(gt=0, description="该调用方预留的突发容量")
     window_quota: int = Field(gt=0, description="该调用方预留的窗口总量")
+
+
+class ReverseRequest(BaseModel):
+    """对一笔已经调成（真用掉）的业务做冲正。
+
+    - idem_key 写明冲哪一笔（调用时带的 Idempotency-Key，业务号）；
+    - amount 冲多少，不能超过那笔当时真用掉的数量；
+    - 一笔业务号只能冲一次，重复提交返回上一次的冲正结果（幂等）；
+    - 只能冲有效密钥上已确认的业务，密钥停用后拒绝新冲正。
+    """
+    idem_key: str = Field(min_length=1, max_length=256, description="被冲正的业务号")
+    amount: int = Field(gt=0, description="冲回数量，不得超过该笔当时真用掉的")
+    note: str = Field(default="", max_length=512, description="备注，随流水留档")
 
 
 def require_admin(authorization: Optional[str] = Header(default=None)) -> None:
@@ -201,21 +224,28 @@ def get_quota(kid: str) -> dict:
     def view(cap_: int, quota_: int, rem_b: int, rem_w: int,
              held_b: int, held_w: int) -> dict:
         # quota.lua 给的是自然口径（停用也照算）。展示层约定：
-        #   * 可再占（remaining）：停用即 0——份额与公共池立即失效；
+        #   * 可再占（remaining）：正常即自然余量；冲正把已确认的量退回后，
+        #     桶/窗口里可能出现“超出容量的溢余”，余量可以大于配额，这部分就是
+        #     冲回去、立刻又能再占的额度——照常亮出，不按容量截断；
         #   * 还占着（held）     ：照实——占用单还在，等约定时限自动退回；
-        #   * 真用掉（consumed） ：按自然口径 配额 − 自然余量 − 还占着，
-        #     停用不会把已经真用掉的账抹掉。
+        #   * 真用掉（consumed） ：配额 − 可再占 − 还占着，冲正后立即跟着少；
+        #     余量超过配额（净冲正 > 自然用量）时为 0，不显示成负数；
+        #   * reversal_credit   ：冲正净退回、超出当前配额的那部分额度
+        #     （= 已冲正 − 当前自然口径仍占用的量），余量里的真用掉为何变少，
+        #     从这个字段一眼能对上流水里的 reversal。
         rem_b, rem_w = max(0, int(rem_b)), max(0, int(rem_w))
         held_b, held_w = max(0, int(held_b)), max(0, int(held_w))
         consumed_b = max(0, cap_ - rem_b - held_b)
         consumed_w = max(0, quota_ - rem_w - held_w)
+        credit_b = max(0, rem_b + held_b - cap_)
+        credit_w = max(0, rem_w + held_w - quota_)
         if revoked:
             rem_b, rem_w = 0, 0
         return {
             "burst": {"capacity": cap_, "remaining": rem_b, "held": held_b,
-                      "consumed": consumed_b},
+                      "consumed": consumed_b, "reversal_credit": credit_b},
             "window": {"quota": quota_, "remaining": rem_w, "held": held_w,
-                       "consumed": consumed_w},
+                       "consumed": consumed_w, "reversal_credit": credit_w},
         }
 
     shares = []
@@ -312,6 +342,88 @@ def get_statement(
     except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
             redis.exceptions.BusyLoadingError) as exc:
         raise QuotaStoreUnavailable() from exc
+
+
+@app.post("/v1/keys/{kid}/reversals", status_code=201,
+          dependencies=[Depends(require_admin)])
+def reverse_consumption(kid: str, body: ReverseRequest) -> dict:
+    """对一笔已经调成（真用掉）的业务做冲正。
+
+    冲正规则（由 reverse.lua 在 Redis 单线程内原子保证）：
+      * 只能冲有效密钥上、已经调成的那一笔——密钥停用、业务号不存在、
+        还占着/已退回的一律拒绝；
+      * 写明冲哪个业务号（idem_key）、冲多少（amount），冲的数量不能超过
+        那笔当时真用掉的；
+      * 一笔业务号只能冲一次：重复提交返回上一次的冲正结果（200，幂等），
+        不二次退额度、不写第二笔流水；
+      * 冲过的额度立刻回到可再占：突发令牌加回原池令牌桶、窗口量从当初确认
+        落的那个固定桶扣掉（已自然老化的维度无账可退，如实标 0）；
+      * 冲正自己在只追加流水上留一笔 reversal，之后不能改。
+    """
+    cfg = _load_config(kid)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="key not found")
+    try:
+        res = reverse_eval(kid, body.idem_key, body.amount, body.note)
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+
+    code = int(res[0])
+    if code == 1:
+        _, eid, amount_done, orig_cost, tb_ref, win_ref, pool, caller = res
+        return {
+            "key_id": kid,
+            "reversal_id": eid,
+            "idem_key": body.idem_key,
+            "amount": int(amount_done),
+            "confirmed_cost": int(orig_cost),
+            "refunded": {
+                "burst": bool(int(tb_ref)),
+                "window": bool(int(win_ref)),
+            },
+            "pool": pool,
+            "caller": caller or None,
+            "note": body.note,
+        }
+    if code == 2:
+        # 这笔业务已经冲过：把原冲正结论还给调用方（幂等，不再动账、不留笔）
+        _, eid, amount_done, orig_cost = res
+        return JSONResponse(status_code=200, content={
+            "key_id": kid,
+            "reversal_id": eid,
+            "idem_key": body.idem_key,
+            "amount": int(amount_done),
+            "confirmed_cost": int(orig_cost),
+            "already_reversed": True,
+        })
+
+    reason = res[1]
+    if reason == "key not found":
+        raise HTTPException(status_code=404, detail="key not found")
+    if reason == "revoked":
+        raise HTTPException(status_code=409, detail={
+            "code": "key_revoked",
+            "message": "key is revoked; already-used quota on a revoked key cannot be reversed",
+        })
+    if reason == "idem_required":
+        raise HTTPException(status_code=422, detail="idem_key is required")
+    if reason == "bad_amount":
+        raise HTTPException(status_code=422, detail="amount must be a positive integer")
+    if reason == "not_confirmed":
+        raise HTTPException(status_code=409, detail={
+            "code": "not_confirmed",
+            "message": "the reservation identified by this idem_key was never confirmed "
+                       "(missing, still held, or released); only confirmed consumption can be reversed",
+        })
+    if reason == "amount_exceeds":
+        raise HTTPException(status_code=422, detail={
+            "code": "amount_exceeds",
+            "message": "reversal amount cannot exceed what that reservation actually consumed",
+            "confirmed_cost": int(res[2]),
+            "requested_amount": body.amount,
+        })
+    raise HTTPException(status_code=400, detail=str(reason))
 
 
 @app.put("/v1/keys/{kid}/shares/{caller}", dependencies=[Depends(require_admin)])

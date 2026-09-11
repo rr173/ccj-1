@@ -1,15 +1,17 @@
-"""占用流水查询与对账单（控制面，只读）。
+"""占用流水查询与对账单（控制面，只读 + 冲正归并）。
 
 流水事实由数据面在 reserve.lua / settle.lua / sweep.lua 内与计数变更原子
-写入：每把密钥一条只追加 Stream ``{qk:<kid>}ledger``，按调用方、业务号各挂
-一个 ZSET 索引。本模块只做读，不写、不改任何流水——Stream 没有修改单条的
-命令，密钥停用、服务重启都不影响已落盘的流水（AOF appendfsync always）。
+写入，冲正由控制面在 reverse.lua 内原子写入：每把密钥一条只追加 Stream
+``{qk:<kid>}ledger``，按调用方、业务号各挂一个 ZSET 索引。本模块只做读，
+不写、不改任何流水——Stream 没有修改单条的命令，密钥停用、服务重启都不影响
+已落盘的流水（AOF appendfsync always）。
 
 两个入口：
   * list_events   ：按密钥（必选）+ 调用方 / 业务号 / 时间段翻流水；
-  * build_statement：拉一段时间的对账单——这段占过多少、真用掉多少、
-                    退回多少、还占着的单列，并把“流水侧真用掉”与
-                    “余量计数侧真用掉（win 桶）”对账，对不上两边数都亮出。
+  * build_statement：拉一段时间的对账单——这段占过多少、真用掉多少（净额，
+                    已去掉冲回去的）、冲正多少（单独列）、退回多少、还占着的
+                    单列，并把“流水侧净真用掉”与“余量计数侧真用掉（win 桶）”
+                    对账，对不上两边数都亮出。
 """
 from __future__ import annotations
 
@@ -39,15 +41,20 @@ def now_ms(r: redis.Redis) -> int:
     return int(sec) * 1000 + int(micro) // 1000
 
 
+def _eid_ms(eid: str) -> int:
+    dash = eid.find("-")
+    return int(eid[:dash]) if dash >= 0 else 0
+
+
 def _parse_event(eid: str, fields: dict, kid: str) -> dict:
     res_full = fields.get("res", "")
     prefix = f"{{qk:{kid}}}res:"
     res_tail = res_full[len(prefix):] if res_full.startswith(prefix) else res_full
-    dash = eid.find("-")
-    return {
+    kind = fields.get("kind", "")
+    out = {
         "id": eid,
-        "ts_ms": int(eid[:dash]) if dash >= 0 else None,
-        "kind": fields.get("kind", ""),
+        "ts_ms": _eid_ms(eid),
+        "kind": kind,
         "caller": fields.get("caller", ""),
         "idem_key": fields.get("idem", ""),
         "pool": fields.get("pool", ""),
@@ -57,6 +64,11 @@ def _parse_event(eid: str, fields: dict, kid: str) -> dict:
         "reserved_at_ms": int(fields.get("reserve_at", "0") or "0"),
         "reservation_id": res_tail,
     }
+    if kind == "reversal":
+        # 冲正专有：被冲那笔当时真用掉的量、管理员备注
+        out["of_cost"] = int(fields.get("of", "0") or "0")
+        out["note"] = fields.get("note", "")
+    return out
 
 
 def _to_ms(value: Optional[float | int | str], name: str) -> Optional[int]:
@@ -198,7 +210,8 @@ def _pool_window_consumed(r: redis.Redis, kid: str,
                           win_seconds: int, idxs: list[int],
                           callers: list[str] | None) -> dict:
     """把对齐窗口内各固定桶的真用掉（win/swin 计数）加起来——这是余量侧
-    “真用掉”的事实来源，与 quota.lua 读的是同一批计数 key。
+    “真用掉”的事实来源，与 quota.lua 读的是同一批计数 key。冲正时
+    reverse.lua 从原确认桶 INCRBY 负数，因此这里读到的天然是冲正后净额。
 
     callers=None  → 公共池（{qk}win:*）
     callers=[...] → 这些点名调用方各自的份额池（{qk}swin:<sha1>:*）
@@ -267,13 +280,39 @@ def _held_open(r: redis.Redis, kid: str, now_ms: int,
     return out
 
 
+def _load_idem_events(r: redis.Redis, stream: str, kid: str,
+                      idem: str) -> list[dict]:
+    """按业务号索引把这笔业务的全部事件（reserve/confirm/release/reversal）
+    取回来。一个业务号至多一条 confirm、一条 reversal。"""
+    zkey = keys.ledger_idem_key(kid, idem)
+    ids = r.zrange(zkey, 0, -1)
+    if not ids:
+        return []
+    pipe = r.pipeline(transaction=False)
+    for i in ids:
+        pipe.xrange(stream, min=i, max=i, count=1)
+    out = []
+    for rows in pipe.execute():
+        if rows:
+            out.append({"eid": rows[0][0], "f": rows[0][1]})
+    return out
+
+
 def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
                     start: float, end: float,
                     caller: Optional[str] = None) -> dict:
-    """拉 [start, end) 的对账单并做真用掉对账。
+    """拉 [start, end) 的对账单并做净真用掉对账（冲正后的口径）。
 
     cfg 为控制面读到的密钥配置 dict（停用密钥照常出账）；不存在时给空 dict，
     此时只剩流水可统计，窗口计数侧对账标记为不可行。
+
+    冲正口径（硬要求）：
+      * 冲正单独列：totals.reversed 是这段【发生】的冲正合计（冲正自己那笔
+        流水落在哪段就算哪段），reversals[] 给逐笔明细；
+      * 真用掉按净额：totals.confirmed = confirmed_gross −
+        reversed_of_confirmed_in_range，绝不还按冲正前的数；更早调成、这段
+        才冲回的计入 reversed_carried，单列但不冲减本区间净真用掉；
+      * 对账两侧（流水侧 / win 桶计数侧）都按冲正后净额。
     """
     start_ms = _to_ms(start, "start")
     end_ms = _to_ms(end, "end")
@@ -286,15 +325,10 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
     stream = keys.ledger_stream_key(kid)
 
     # ── 按占用单归并，而不是逐笔流水累加 ──
-    # 一笔单在流水里可能有 1~3 个事件：
-    #   reserve；reserve + confirm（调成）；
-    #   reserve + release（没调成）；
-    #   reserve + release(timeout) + confirm(late=1)（先超时退回、之后迟到调成）。
-    # 对账单以单子的【最终结局】归类：
-    #   有 confirm（含迟到）  → 只算真用掉，绝不进退回；
-    #   只有 release          → 只算退回；
-    #   都没有                → 还占着（pending，与 held_open 分列口径一致）。
-    # 这样“已调成的不会又算进退回”，三类互斥且完备。
+    # 一笔单在流水里可能有 reserve/confirm/release/reversal 若干事件。归并
+    # 只看结局（confirm 含迟到确认盖过早先 timeout release）：
+    #   有 confirm → 只算真用掉毛额；只有 release → 只算退回；都没有 → 还占着。
+    # 冲正不改写结局，不在归并里处理，另按冲正事件单独列。
     units: dict[str, dict] = {}
 
     def ingest(rid: str, fields: dict) -> None:
@@ -309,7 +343,7 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         u["caller"] = fields.get("caller", "")
         kind = fields.get("kind", "")
         if kind == "reserve":
-            u["reserved_at"] = int(fields.get("reserve_at", "0") or 0)
+            u["reserved_at"] = int(fields.get("reserve_at", "0") or "0")
         elif kind == "confirm":
             u["confirmed"] = True
             if fields.get("late") == "1":
@@ -318,11 +352,18 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
             u["released"] = True
             u["reasons"].add(fields.get("reason") or "upstream")
 
-    # 1) 区间内的流水：归属本账单（按 reserve 落在区间内）
+    # 区间内发生的冲正事件（冲正单独列；落在哪段算哪段，与被冲业务无关）
+    rev_in_range: list[dict] = []
+
+    # 1) 区间内的流水：结局事件按占用单归并；reserve 决定单子归属哪张账单；
+    #    reversal 不参与结局归并，单独收集。
     for eid, f in _iter_stream(r, stream, start_ms, end_ms):
         if caller and f.get("caller", "") != caller:
             continue
         rid = f.get("res", "")
+        if f.get("kind") == "reversal":
+            rev_in_range.append({"eid": eid, "f": f})
+            continue
         ingest(rid, f)
         if f.get("kind") == "reserve":
             units[rid]["in_range"] = True
@@ -339,14 +380,47 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
             if caller and f.get("caller", "") != caller:
                 continue
             rid = f.get("res", "")
+            if f.get("kind") == "reversal":
+                continue
             u = units.get(rid)
             if u is not None and not u["confirmed"] and not u["released"]:
                 ingest(rid, f)
 
+    # 3) 给区间内每笔冲正挂上它冲的那笔确认（确认可能落在区间之前），
+    #    判定“冲的是不是本区间调成的业务”（本区间净真用掉只减这部分）。
+    idem_events: dict[str, list[dict]] = {}
+
+    def confirm_for(evs: list[dict]):
+        for ev in evs:
+            if ev["f"].get("kind") == "confirm":
+                return ev
+        return None
+
+    for item in rev_in_range:
+        idem = item["f"].get("idem", "")
+        evs = idem_events.get(idem)
+        if evs is None:
+            evs = _load_idem_events(r, stream, kid, idem)
+            idem_events[idem] = evs
+        item["confirm"] = confirm_for(evs)
+        rid = item["f"].get("res", "")
+        u = units.get(rid)
+        item["confirmed_in_range"] = bool(u and u["in_range"] and u["confirmed"])
+
+    rev_total = sum(int(i["f"].get("cost", "1") or "1") for i in rev_in_range)
+    rev_in_range_confirmed = sum(
+        int(i["f"].get("cost", "1") or "1") for i in rev_in_range
+        if i["confirmed_in_range"])
+    rev_carried = rev_total - rev_in_range_confirmed
+
     totals = {
-        "reserved": 0,          # 这段占过的（= 确认 + 退回 + 还占着，互斥合计）
-        "confirmed": 0,         # 真用掉（最终调成的，含迟到确认）
+        "reserved": 0,          # 这段占过的（毛额：确认毛额 + 退回 + 还占着，互斥合计）
+        "confirmed": 0,         # 净真用掉 = confirmed_gross − 本区间调成且被冲回
+        "confirmed_gross": 0,   # 真用掉毛额（最终调成的，含迟到确认，冲正前）
         "confirmed_late": 0,    #   其中：先超时退回、后迟到调成的
+        "reversed": rev_total,  # 这段发生的冲正合计（单独列，冲正自己也算一笔）
+        "reversed_of_confirmed_in_range": rev_in_range_confirmed,
+        "reversed_carried": rev_carried,  #   其中：更早调成、这段才冲回的
         "released": 0,          # 退回（最终没调成的；已调成的永不进这里）
         "released_upstream": 0,
         "released_timeout": 0,
@@ -356,7 +430,8 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
 
     def pool_bucket(pool: str) -> dict:
         return by_pool.setdefault(pool, {
-            "reserved": 0, "confirmed": 0, "released": 0, "held": 0})
+            "reserved": 0, "confirmed_gross": 0, "reversed": 0,
+            "confirmed": 0, "released": 0, "held": 0})
 
     for rid, u in units.items():
         if not u["in_range"]:
@@ -366,10 +441,10 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         totals["reserved"] += c
         b["reserved"] += c
         if u["confirmed"]:
-            # 最终调成：只算真用掉；即使流水里早先有 release(timeout)，
+            # 最终调成：只算真用掉毛额；即使流水里早先有 release(timeout)，
             # 也绝不再算进退回。
-            totals["confirmed"] += c
-            b["confirmed"] += c
+            totals["confirmed_gross"] += c
+            b["confirmed_gross"] += c
             if u["late"]:
                 totals["confirmed_late"] += c
         elif u["released"]:
@@ -385,6 +460,23 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
             totals["held_pending"] += c
             b["held"] += c
 
+    totals["confirmed"] = totals["confirmed_gross"] - rev_in_range_confirmed
+
+    # 池维度：冲正按发生段计 reversed；池净额只减“本池本区间调成且本区间冲回”
+    for pool in by_pool:
+        b = by_pool[pool]
+        pool_rev = 0
+        pool_rev_in_confirmed = 0
+        for item in rev_in_range:
+            if (item["f"].get("pool") or "shared") != pool:
+                continue
+            cc = int(item["f"].get("cost", "1") or "1")
+            pool_rev += cc
+            if item["confirmed_in_range"]:
+                pool_rev_in_confirmed += cc
+        b["reversed"] = pool_rev
+        b["confirmed"] = b["confirmed_gross"] - pool_rev_in_confirmed
+
     held = _held_open(r, kid, now, start_ms, end_ms)
     if caller:
         held = [h for h in held if h["caller"] == caller]
@@ -393,15 +485,37 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
     held_cost = sum(h["cost"] for h in held)
     held_in_range_cost = sum(h["cost"] for h in held_in_range)
 
-    # ── 真用掉对账：流水侧 confirm vs 余量侧 win/swin 固定桶计数 ──
-    # 计数只按固定桶存活，因此把对账区间对齐到桶边界，两边同口径。
+    # 冲正逐笔明细（按发生时间升序）：写明冲哪个业务号、冲多少、冲的是不是
+    # 本区间调成的那笔
+    reversals_out = []
+    for item in sorted(rev_in_range, key=lambda x: x["eid"]):
+        f = item["f"]
+        conf = item["confirm"]
+        reversals_out.append({
+            "id": item["eid"],
+            "ts_ms": _eid_ms(item["eid"]),
+            "idem_key": f.get("idem", ""),
+            "caller": f.get("caller", ""),
+            "pool": f.get("pool", ""),
+            "amount": int(f.get("cost", "1") or "1"),
+            "confirmed_cost": (
+                int(conf["f"].get("cost", "1") or "1") if conf
+                else int(f.get("of", "0") or "0")),
+            "confirmed_in_range": item["confirmed_in_range"],
+            "note": f.get("note", ""),
+        })
+
+    # ── 真用掉对账：流水侧净额 vs 余量侧 win/swin 固定桶计数 ──
+    # 两边都按冲正后净额：流水侧把每笔冲正挂回它【原确认落的那个桶】扣减；
+    # 计数侧 reverse.lua 也是从原确认桶 INCRBY -amount（桶已老化的不动）。
     win_seconds = int(cfg.get(keys.F_WINDOW_SECONDS, 0) or 0)
     reconciliation = {
         "feasible": False,
         "dimension": "window",
         "window_seconds": win_seconds or None,
         "ledger_confirmed": totals["confirmed"],
-        "ledger_confirmed_late": totals["confirmed_late"],
+        "ledger_confirmed_gross": totals["confirmed_gross"],
+        "ledger_reversed": rev_in_range_confirmed,
         "counter_consumed": None,
         "aligned_start_ms": None,
         "aligned_end_ms": None,
@@ -418,16 +532,39 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         aligned_start_ms = a_start_idx * win_ms
         aligned_end_ms = a_end_idx * win_ms
 
-        # 对齐区间内的流水侧 confirm（可能与请求区间略有差异，单独算）
-        ledger_aligned = 0
+        # 对齐区间内逐桶统计：confirm 加、reversal 按其原确认桶减。冲正的
+        # 原确认若在对齐区间之外（区间扫描看不到那条 confirm），用业务号索引
+        # 取该 confirm 的 entry id 定位桶；原确认桶不在对齐区间则计数侧那个
+        # 桶也不在本次求和里，自然跳过。
+        ledger_gross_aligned = 0
+        ledger_rev_aligned = 0
+        for eid, f in _iter_stream(r, stream, aligned_start_ms, aligned_end_ms):
+            if caller and f.get("caller", "") != caller:
+                continue
+            kind = f.get("kind", "")
+            c = int(f.get("cost", "1") or "1")
+            if kind == "confirm":
+                ledger_gross_aligned += c
+            elif kind == "reversal":
+                idem = f.get("idem", "")
+                evs = idem_events.get(idem)
+                if evs is None:
+                    evs = _load_idem_events(r, stream, kid, idem)
+                    idem_events[idem] = evs
+                conf = confirm_for(evs)
+                if conf is not None:
+                    conf_idx = _eid_ms(conf["eid"]) // win_ms
+                    if a_start_idx <= conf_idx < a_end_idx:
+                        ledger_rev_aligned += c
+        ledger_net_aligned = ledger_gross_aligned - ledger_rev_aligned
+
+        # aligned 区间确认毛额（含迟到标记），用于对不上时给原因
         late_aligned = 0
         for eid, f in _iter_stream(r, stream, aligned_start_ms, aligned_end_ms):
             if caller and f.get("caller", "") != caller:
                 continue
-            if f.get("kind") == "confirm":
-                ledger_aligned += int(f.get("cost", "1") or "1")
-                if f.get("late") == "1":
-                    late_aligned += int(f.get("cost", "1") or "1")
+            if f.get("kind") == "confirm" and f.get("late") == "1":
+                late_aligned += int(f.get("cost", "1") or "1")
 
         shares = r.hgetall(keys.shares_key(kid))
         counter_pools = []
@@ -436,6 +573,7 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         # 计数桶只在确认时写、TTL=2 个窗口+5s（settle.lua）。只要对齐区间的
         # 最早一个桶还落在保留期内，缺失的桶一定是“从没写过(=0)”而不是
         # “写过后过期”，计数侧才可对账；更早的历史只剩流水这一份事实。
+        # 冲正只对仍存在的桶 INCRBY 负数、不新建桶，规则相同。
         retained_idx = (now - (2 * win_ms + 5000)) // win_ms
         counters_retained = a_start_idx >= retained_idx
         if not counters_retained:
@@ -470,23 +608,24 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
                 counter_total += share_spec["total"]
 
         feasible = counters_retained and not unattributable
-        if feasible and ledger_aligned != counter_total:
+        if feasible and ledger_net_aligned != counter_total:
             late_note = ""
             if late_aligned:
                 late_note = (f"; {late_aligned} late confirmation(s) were "
                              "counted in a later window bucket than reserved")
-            notes.append("ledger confirmed and window counters disagree"
+            notes.append("ledger net confirmed and window counters disagree"
                          + late_note)
 
         reconciliation.update({
             "feasible": feasible,
-            "ledger_confirmed": ledger_aligned,
-            "ledger_confirmed_late": late_aligned,
+            "ledger_confirmed": ledger_net_aligned,
+            "ledger_confirmed_gross": ledger_gross_aligned,
+            "ledger_reversed": ledger_rev_aligned,
             "counter_consumed": counter_total,
             "aligned_start_ms": aligned_start_ms,
             "aligned_end_ms": aligned_end_ms,
-            "matched": feasible and ledger_aligned == counter_total,
-            "difference": (counter_total - ledger_aligned) if feasible else None,
+            "matched": feasible and ledger_net_aligned == counter_total,
+            "difference": (counter_total - ledger_net_aligned) if feasible else None,
             "note": " ".join(notes),
             "pools": counter_pools,
         })
@@ -503,6 +642,7 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         "settle_lookahead_ms": SETTLE_LOOKAHEAD_MS,
         "totals": totals,
         "by_pool": by_pool,
+        "reversals": reversals_out,
         "held_open": {
             "total_holds": len(held),
             "total_cost": held_cost,

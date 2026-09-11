@@ -294,6 +294,10 @@ else
   local old_ts     = tonumber(redis.call("HGET", eff_tb_key, "ts"))
   if not old_tokens or not old_ts then
     tokens = eff_capacity * SCALE
+  elseif old_tokens >= eff_capacity * SCALE then
+    -- 桶里已是溢余状态（冲正退回的额度加回了令牌桶）：时间补充只补到
+    -- 容量为止，溢余部分不随补充被抹掉，冲回去的额度立刻能再占。
+    tokens = old_tokens
   else
     local elapsed = now_us - old_ts  -- 微秒
     if elapsed < 0 then elapsed = 0 end

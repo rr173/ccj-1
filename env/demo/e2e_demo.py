@@ -107,6 +107,17 @@ def statement(kid: str, start: int, end: int, query: str = ""):
     return body
 
 
+def reverse(kid: str, idem: str, amount: int = 1, note: str = ""):
+    return http("POST", f"{CP}/v1/keys/{kid}/reversals",
+                {"Authorization": f"Bearer {ADMIN}"},
+                {"idem_key": idem, "amount": amount, "note": note})
+
+
+def revoke(kid: str):
+    return http("POST", f"{CP}/v1/keys/{kid}/revoke",
+                {"Authorization": f"Bearer {ADMIN}"})
+
+
 def wait_healthy() -> None:
     for base, plane in ((CP, "control"), (DP, "data")):
         for _ in range(60):
@@ -681,6 +692,147 @@ def t_ledger_and_statement() -> None:
            f"events={ev_r['returned']} confirmed={st_r['totals']['confirmed']}")
 
 
+def t_reversal() -> None:
+    print("\n=== 11) 冲正已真用掉的一笔（只冲已调成、一次、不超额，立刻可再占） ===")
+    # 11a. 冲正公共池一笔：余量里的真用掉立刻少、额度立刻能再占
+    t0 = int(time.time())
+    kid, key = issue_key("reverse", burst=3, refill_ms=100000, win_s=300, win_q=3)
+    s1, _, _ = call_dp(key, idem="R-1")
+    s2, _, _ = call_dp(key, idem="R-2")
+    record("准备：两笔调成（真用掉 2/3）",
+           s1 == 200 and s2 == 200
+           and quota(kid)["burst"]["consumed"] == 2,
+           f"{s1}/{s2}")
+
+    sr, _, br = reverse(kid, "R-1", note="billing correction")
+    q = quota(kid)
+    record("冲正成功返回 201 且写明业务号/冲多少/冲的哪一笔",
+           sr == 201 and br["amount"] == 1 and br["idem_key"] == "R-1"
+           and br["confirmed_cost"] == 1 and br["refunded"] == {"burst": True, "window": True},
+           f"{sr} {br}")
+    record("冲正后余量里真用掉立刻少（2→1），可再占立刻多（1→2）",
+           q["burst"]["consumed"] == 1 and q["burst"]["remaining"] == 2
+           and q["window"]["consumed"] == 1 and q["window"]["remaining"] == 2,
+           json.dumps({"burst": q["burst"], "window": q["window"]}, ensure_ascii=False))
+    record("冲回去的额度立刻能再占（再调两笔都成）",
+           call_dp(key, idem="R-new1")[0] == 200
+           and call_dp(key, idem="R-new2")[0] == 200,
+           json.dumps(quota(kid)["burst"], ensure_ascii=False))
+
+    # 11b. 一笔业务号只能冲一次：再来不能再冲（幂等回原结论）
+    consumed_before = quota(kid)["burst"]["consumed"]
+    sr2, _, br2 = reverse(kid, "R-1")
+    q2 = quota(kid)
+    record("同一业务号再冲：200 幂等回原结论，不二次退额度、不写第二笔",
+           sr2 == 200 and br2.get("already_reversed") is True
+           and br2["reversal_id"] == br["reversal_id"] and br2["amount"] == 1
+           and q2["burst"]["consumed"] == consumed_before,
+           f"{sr2} {br2}")
+
+    # 11c. 冲的数量不能超过那笔当时真用掉的
+    sr3, _, br3 = reverse(kid, "R-2", amount=2)
+    record("冲 2 但那笔只用了 1：422 amount_exceeds，亮出原值",
+           sr3 == 422 and br3["detail"]["code"] == "amount_exceeds"
+           and br3["detail"]["confirmed_cost"] == 1,
+           f"{sr3} {br3.get('detail')}")
+    sr0, _, _ = reverse(kid, "R-2", amount=0)
+    record("冲 0 / 负数被 422 拒绝", sr0 == 422, f"{sr0}")
+
+    # 11d. 只能冲已经调成的：没调成的、不存在的、没给业务号都不行
+    kid4, key4 = issue_key("reverse-notconf", burst=5, refill_ms=100000,
+                           win_s=300, win_q=5)
+    sf, _, _ = call_dp(key4, idem="R-fail", path="/fail")  # 502 已退回
+    srf, _, brf = reverse(kid4, "R-fail")
+    srn, _, brn = reverse(kid4, "R-nope")
+    record("没调成（已退回）/ 查无此业务号：409 not_confirmed",
+           sf == 502 and srf == 409 and srn == 409
+           and brf["detail"]["code"] == "not_confirmed"
+           and brn["detail"]["code"] == "not_confirmed",
+           f"{sf}/{srf}/{srn}")
+
+    # 11e. 冲正自己留一笔、只一笔，且可按业务号翻
+    ev = ledger(kid, "idem_key=R-1&order=asc")
+    pairs = [(e["kind"], e["reason"], e["cost"]) for e in ev["events"]]
+    record("流水里冲正单独一笔（reserve/confirm/reversal），带业务号与备注",
+           pairs == [("reserve", "", 1), ("confirm", "", 1),
+                     ("reversal", "reversal", 1)]
+           and ev["events"][2]["of_cost"] == 1
+           and ev["events"][2]["note"] == "billing correction",
+           json.dumps(pairs, ensure_ascii=False))
+    reverse(kid, "R-1")  # 幂等重放
+    record("冲正流水只追加一笔，重放不新增",
+           ledger(kid, "idem_key=R-1")["returned"] == 3, "")
+
+    # 11f. 对账单：冲正单独列、真用掉按净额（不按冲正前）
+    st = statement(kid, t0 - 60, int(time.time()) + 60)
+    t = st["totals"]
+    rec = st["reconciliation"]
+    # R-1、R-2、R-new1、R-new2 共 4 笔调成毛额；R-1 冲回 1
+    ok_stmt = (t["confirmed_gross"] == 4 and t["reversed"] == 1
+               and t["reversed_of_confirmed_in_range"] == 1
+               and t["confirmed"] == 3)
+    record("对账单：冲正单列，净真用掉 = 毛额 − 冲回（4−1=3，不按冲正前 4）",
+           ok_stmt, json.dumps(t, ensure_ascii=False))
+    record("reversals[] 逐笔写明冲哪个业务号、冲多少",
+           len(st["reversals"]) == 1 and st["reversals"][0]["idem_key"] == "R-1"
+           and st["reversals"][0]["amount"] == 1
+           and st["reversals"][0]["confirmed_cost"] == 1
+           and st["reversals"][0]["confirmed_in_range"] is True,
+           json.dumps(st["reversals"], ensure_ascii=False))
+    record("对账：流水净额与 win 桶计数（冲正后）一致",
+           rec["matched"] is True and rec["ledger_confirmed"] == 3
+           and rec["ledger_confirmed_gross"] == 4 and rec["ledger_reversed"] == 1
+           and rec["counter_consumed"] == 3 and rec["difference"] == 0,
+           json.dumps({k: rec[k] for k in ("matched", "ledger_confirmed",
+                   "ledger_confirmed_gross", "ledger_reversed",
+                   "counter_consumed", "difference")}, ensure_ascii=False))
+
+    # 11g. 密钥停了以后不能再冲，但已经冲过的流水/对账单还能翻
+    kid2, key2 = issue_key("reverse-revoke", burst=5, refill_ms=100000,
+                           win_s=300, win_q=5)
+    t0b = int(time.time())
+    call_dp(key2, idem="K-1")
+    srev, _, brev = reverse(kid2, "K-1")
+    record("停用前冲正成功", srev == 201, f"{srev}")
+    revoke(kid2)
+    sra, _, bra = reverse(kid2, "K-1")
+    call_dp(key2, idem="K-2")  # 确认停用生效
+    record("停用后不能再冲（409 key_revoked），新调用也 403",
+           sra == 409 and bra["detail"]["code"] == "key_revoked",
+           f"{sra} {bra.get('detail')}")
+    ev_r = ledger(kid2, "idem_key=K-1")
+    st_r = statement(kid2, t0b - 60, int(time.time()) + 60)
+    record("停用后：已冲过的流水还能翻、对账单还能拉，冲正仍单列",
+           any(e["kind"] == "reversal" for e in ev_r["events"])
+           and st_r["state"] == "revoked"
+           and st_r["totals"]["reversed"] == 1
+           and st_r["totals"]["confirmed"] == 0
+           and st_r["totals"]["confirmed_gross"] == 1,
+           json.dumps(st_r["totals"], ensure_ascii=False))
+
+    # 11h. 份额池的冲正：退回点名调用方自己的池，与公共池互不相通
+    kid3, key3 = issue_key("reverse-share", burst=4, refill_ms=100000,
+                           win_s=300, win_q=4)
+    set_share(kid3, "alice", 2, 2)
+    sa, _, _ = call_dp(key3, idem="S-1", client="alice")
+    call_dp(key3, idem="S-pub")  # 公共池 1 笔
+    ss, _, bs = reverse(kid3, "S-1")
+    q3 = quota(kid3)
+    alice_share = next(s for s in q3["shares"] if s["caller"] == "alice")
+    record("份额池调成 1 笔后冲正：退回 alice 自己的池（她恢复 2，公共池不动）",
+           sa == 200 and ss == 201 and bs["pool"] == "share"
+           and alice_share["burst"]["consumed"] == 0
+           and alice_share["burst"]["remaining"] == 2
+           and q3["shared_pool"]["burst"]["consumed"] == 1,
+           json.dumps({"alice": alice_share["burst"],
+                       "pool": q3["shared_pool"]["burst"]}, ensure_ascii=False))
+    record("alice 能立刻再占自己的 2 个",
+           call_dp(key3, idem="S-a1", client="alice")[0] == 200
+           and call_dp(key3, idem="S-a2", client="alice")[0] == 200
+           and call_dp(key3, idem="S-a3", client="alice")[0] == 429,
+           "alice 冲正后恰好 2 个")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--restart", action="store_true",
@@ -697,6 +849,7 @@ def main() -> None:
     t_auth_and_revoke()
     t_shares()
     t_ledger_and_statement()
+    t_reversal()
     if args.restart:
         compose = str(Path(__file__).resolve().parent.parent / "docker-compose.yml")
         t_restart_durability(compose)

@@ -80,6 +80,12 @@ local function bucket_tokens(tb, cap)
   if not old_tokens or not old_ts then
     return cap * SCALE
   end
+  -- 冲正退回会把令牌加回桶里并允许高于容量（溢余）。溢余不随时间补充被
+  -- min(cap) 抹掉——这正是“冲回去的真用掉立刻回到可再占”，控制面只读视图
+  -- 与数据面下一次判定（reserve.lua）保持同一口径。
+  if old_tokens >= cap * SCALE then
+    return old_tokens
+  end
   local elapsed = now_us - old_ts
   if elapsed < 0 then elapsed = 0 end
   local elapsed_ms = elapsed / 1000
