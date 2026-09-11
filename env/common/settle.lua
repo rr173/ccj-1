@@ -69,6 +69,10 @@ if not kid or kid == "" then
   local kp = string.match(res_key, "^{qk:([^}]+)}")
   if kp then kid = kp end
 end
+-- 这笔调用实际出示的明文哈希（密钥换新后区分“新旧各自真用掉多少”）。
+-- 老版本占下的单子没有 cred 字段：回退逻辑 kid，归属签发时那把明文。
+local cred         = h.cred or ""
+if cred == "" then cred = kid end
 local cost         = tonumber(h.cost or "1")
 local holds_key    = h.holds
 local wholds_key   = h.wholds
@@ -92,7 +96,8 @@ local function ledger_add(kind, reason, late)
     "late", late and "1" or "0",
     "reserve_at", tostring(h.reserved_at_ms or 0),
     "pool_pid", pool_pid,
-    "fb_for", fb_for)
+    "fb_for", fb_for,
+    "cred", cred)
   local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
   local caller = h.caller or ""
   if caller ~= "" then
@@ -135,7 +140,8 @@ local function ledger_mirror_primary(kind, reason, late)
     "pool_pid", pool_pid,
     "fb_for", fb_for,
     "fbmirror", "1",
-    "fb_key", kid or "")
+    "fb_key", kid or "",
+    "cred", cred)
   local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
   local caller = h.caller or ""
   if caller ~= "" then
@@ -321,6 +327,18 @@ if action == "confirm" then
   end
 
   redis.call("HSET", res_key, "outcome", "confirmed")
+  -- 密钥换新：按“这笔调用实际出示的明文”累计真用掉。新旧明文共用逻辑 kid
+  -- 名下同一份突发/窗口（上面扣的就是那一份），这里只做按明文的归因计数，
+  -- 不新增、不复制任何额度；冲正（reverse.lua）会从同一计数减回净额。
+  -- 迟到确认只在之前未确认时走到这里（expired→confirmed），仍只加一次。
+  if cred and cred ~= "" then
+    redis.call("INCRBY", "{qk:" .. kid .. "}rcu:" .. cred, cost)
+    -- 顶上备钥调成的：按明文的真用掉归因同步加一笔到主钥名下（与流水镜像、
+    -- fbsv.used 同一取舍），主钥换新视图里新旧明文各自真用掉才不缺这笔。
+    if fb_for ~= "" then
+      redis.call("INCRBY", "{qk:" .. fb_for .. "}rcu:" .. cred, cost)
+    end
+  end
   -- 顶上备钥真用掉一笔：主钥视角“备钥已替它真用掉多少”加一。正常确认时
   -- 这笔还在顶，active 同步减一；迟到确认（单子此前已超时退回，active 在
   -- reserve.lua/sweep.lua 超时终结时减过）只加真用掉，绝不重复减 active。

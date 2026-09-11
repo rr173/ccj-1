@@ -64,6 +64,7 @@ def _parse_event(eid: str, fields: dict, kid: str) -> dict:
         "late": fields.get("late", "0") == "1",
         "reserved_at_ms": int(fields.get("reserve_at", "0") or "0"),
         "reservation_id": res_tail,
+        "credential_id": fields.get("cred", ""),
     }
     if kind == "reversal":
         # 冲正专有：被冲那笔当时真用掉的量、管理员备注

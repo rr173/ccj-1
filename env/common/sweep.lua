@@ -32,7 +32,7 @@ local function zremove_all(zh, zw, rkey, cost_val)
   if zw and zw ~= "" then redis.call("ZREM", zw, unpack(mm)) end
 end
 
-local function append_timeout(kid, rkey, caller, idem, reserve_at, cost_val, pool_pid)
+local function append_timeout(kid, rkey, caller, idem, reserve_at, cost_val, pool_pid, cred)
   if not kid or kid == "" then return end
   local ledger_key = "{qk:" .. kid .. "}ledger"
   local eid = redis.call("XADD", ledger_key, "*",
@@ -45,7 +45,8 @@ local function append_timeout(kid, rkey, caller, idem, reserve_at, cost_val, poo
     "reason", "timeout",
     "late", "0",
     "reserve_at", reserve_at or "0",
-    "pool_pid", pool_pid or "")
+    "pool_pid", pool_pid or "",
+    "cred", cred or "")
   local cut = string.find(eid, "-", 1, true)
   local score = cut and tonumber(string.sub(eid, 1, cut - 1)) or now_ms
   if caller and caller ~= "" then
@@ -75,7 +76,7 @@ for _, m in ipairs(expired_members) do
       if is_pool then
         local f = redis.call("HMGET", rkey, "outcome", "lease_exp_ms", "cost",
                              "holds", "wholds", "kid", "caller", "idem",
-                             "reserved_at_ms", "key_res")
+                             "reserved_at_ms", "key_res", "cred")
         if f[1] == "" and (tonumber(f[2] or "0") or 0) <= now_ms then
           local cost_val = tonumber(f[3] or "1") or 1
           local paired_timeout = false
@@ -93,8 +94,9 @@ for _, m in ipairs(expired_members) do
           zremove_all(f[4], f[5], rkey, cost_val)
           redis.call("HSET", rkey, "outcome", "expired")
           if paired_timeout then
+            local pcred = redis.call("HGET", kr, "cred") or f[11] or ""
             append_timeout(f[6], kr, f[7], f[8], f[9], cost_val,
-                           string.sub(tag, 4))
+                           string.sub(tag, 4), pcred)
           end
           finalized = finalized + 1
         end
@@ -102,7 +104,7 @@ for _, m in ipairs(expired_members) do
         local f = redis.call("HMGET", rkey, "outcome", "lease_exp_ms", "cost",
                              "holds", "wholds", "caller", "idem", "pool",
                              "reserved_at_ms", "kid", "pool_pid", "pool_pres",
-                             "fb_for")
+                             "fb_for", "cred")
         if f[1] == "" and (tonumber(f[2] or "0") or 0) <= now_ms and f[10] then
           local cost_val = tonumber(f[3] or "1") or 1
           local ppid, ppr = f[11] or "", f[12] or ""
@@ -131,7 +133,8 @@ for _, m in ipairs(expired_members) do
             "late", "0",
             "reserve_at", f[9] or "0",
             "pool_pid", ppid,
-            "fb_for", f[13] or "")
+            "fb_for", f[13] or "",
+            "cred", f[14] or "")
           if f[13] and f[13] ~= "" then
             -- 顶上备钥的单子被冷池兜底超时：同步镜像一笔 timeout 到主钥账本
             local meid = redis.call("XADD", "{qk:" .. f[13] .. "}ledger", "*",
@@ -147,7 +150,8 @@ for _, m in ipairs(expired_members) do
               "pool_pid", ppid,
               "fb_for", f[13],
               "fbmirror", "1",
-              "fb_key", f[10])
+              "fb_key", f[10],
+              "cred", f[14] or "")
             local mscore = tonumber(string.sub(meid, 1,
               string.find(meid, "-", 1, true) - 1)) or now_ms
             if f[6] and f[6] ~= "" then

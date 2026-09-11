@@ -27,6 +27,10 @@
 -- KEYS[4] = res    占用单 hash，例如 {qk:<kid>}res:<sha256(业务号)>（匿名调用
 --                  由数据面生成随机单号；同一业务号命中同一张单子）
 -- KEYS[5] = ledger 占用流水 Stream，例如 {qk:<kid>}ledger（只 XADD，永不修改）
+-- KEYS[6] = rstat  换新状态 hash，例如 {qk:<kid>}rstat（没换过新即不存在；
+--                  数据面按逻辑 kid 传同一固定 key，存在与否本脚本自适应）
+--                  注意：这里的 kid 一定是【逻辑配额身份】（数据面已先按
+--                  {qk:<cred32>}rcr 别名把调用明文解析回逻辑 kid）。
 --
 -- ARGV:
 --  1  kid                密钥ID（仅用于拼窗口桶 key）
@@ -49,6 +53,16 @@
 --                        {qk:<master>}fbrt:<sha256(业务号)>，与备钥占用同一原子动作
 --                        落盘；空串表示匿名顶上或不需要路由
 --  15 fb_stats_key       主钥侧统计 hash {qk:<master>}fbsv（空串则不碰统计）
+--  16 presented_cred     本次调用实际出示的明文哈希（cred32=sha256 前32位）。
+--                        空串表示系统内部路径（主备顶上/业务号路由命中），
+--                        不做换新门判定；外部新占必须通过换新门：
+--                        没换过新 → 只认签发时那一把（presented_cred==kid）；
+--                        宽限期没到 → 当前/上一版明文都能占，吃同一份配额；
+--                        宽限期过了 / 旧明文已被提前收掉 → 旧明文不能再占新的。
+--  17 identity_cred     记账用的明文哈希：永远是调用方对外出示的那把
+--                        （主备顶上时 presented_cred 为空，identity 仍是调用方
+--                        出示的主钥明文）；占用单 cred 字段/各明文真用掉计数
+--                        都按它归属。缺省回退 presented_cred，再缺省回退 kid。
 --
 -- 返回（全部为整/字符串数组）：
 --   {1, remaining_burst, remaining_window, lease_expires_unix}        占成功
@@ -57,6 +71,9 @@
 --       outcome: ""（占用还在）/ "confirmed" / "released" /
 --                "timeout"（约定回音时限过了没回音，已按超时退回，不能再占）
 --   {3, error_message}                                                参数/配置错误
+--       error_message 另可能为 "credential_retired"（出示的明文已被收掉或
+--       超过说好的宽限时间）/ "unknown_credential"（明文不属于本密钥），
+--       数据面分别报 403/401。
 --
 -- 设计要点：
 --  * 令牌桶以千分之一令牌为单位存整数，避免浮点漂移导致“凭空多出额度”。
@@ -74,6 +91,7 @@ local tb_key     = KEYS[2]
 local shares_key = KEYS[3]
 local res_key    = KEYS[4]
 local ledger_key = KEYS[5]
+local rstat_key  = KEYS[6]
 
 local kid             = ARGV[1]
 local capacity        = tonumber(ARGV[2])
@@ -90,6 +108,9 @@ local fb_role         = ARGV[12] or ""
 local fb_master_kid   = ARGV[13] or ""
 local fb_route_key    = ARGV[14] or ""
 local fb_stats_key    = ARGV[15] or ""
+local presented_cred  = ARGV[16] or ""
+local identity_cred   = ARGV[17] or presented_cred or ""
+if identity_cred == "" then identity_cred = kid end
 
 if not capacity or not refill_ms or not window_seconds or not window_quota
    or not cost or not lease_seconds or capacity <= 0 or refill_ms <= 0
@@ -122,7 +143,8 @@ local function ledger_add(kind, rk, cost_val, reason, late, rfields)
     "late", late and "1" or "0",
     "reserve_at", tostring(rfields.reserve_at_ms or 0),
     "pool_pid", pool_pid,
-    "fb_for", rfields.fb_for or "")
+    "fb_for", rfields.fb_for or "",
+    "cred", rfields.cred or "")
   local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
   local caller = rfields.caller or ""
   if caller ~= "" then
@@ -156,7 +178,8 @@ local function ledger_mirror_primary(kind, rk, cost_val, reason, late, rfields)
     "pool_pid", pool_pid,
     "fb_for", fb_master_kid,
     "fbmirror", "1",
-    "fb_key", kid)
+    "fb_key", kid,
+    "cred", rfields.cred or "")
   local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
   local caller = rfields.caller or ""
   if caller ~= "" then
@@ -179,7 +202,8 @@ end
 local function finalize_expired(rkey)
   local f = redis.call("HMGET", rkey, "outcome", "lease_exp_ms", "cost",
                        "holds", "wholds", "caller", "idem", "pool",
-                       "reserved_at_ms", "pool_pid", "pool_pres", "fb_for")
+                       "reserved_at_ms", "pool_pid", "pool_pres", "fb_for",
+                       "cred")
   local fo = f[1]
   if not fo or fo ~= "" then
     return false
@@ -202,7 +226,8 @@ local function finalize_expired(rkey)
   redis.call("HSET", rkey, "outcome", "expired")
   ledger_add("release", rkey, cost_val, "timeout", false,
              {caller = f[6] or "", idem = f[7] or "", pool = f[8] or "",
-              reserve_at_ms = f[9] or "0", fb_for = f[12] or ""})
+              reserve_at_ms = f[9] or "0", fb_for = f[12] or "",
+              cred = f[13] or ""})
   -- 这笔是顶上备钥占的：备钥侧单子先超时，主钥视角的“此刻在顶”减一
   local fb_for = f[12] or ""
   if fb_for ~= "" then
@@ -222,7 +247,8 @@ local function finalize_expired(rkey)
       "pool_pid", f[10] or "",
       "fb_for", fb_for,
       "fbmirror", "1",
-      "fb_key", kid)
+      "fb_key", kid,
+      "cred", f[13] or "")
     local mscore = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
     local mcaller = f[6] or ""
     if mcaller ~= "" then
@@ -293,6 +319,39 @@ end
 -- 3) revoked 检查在任何份额逻辑之前：密钥一停用，所有份额与公共池立即失效
 if redis.call("HGET", cfg_key, "revoked") == "1" then
   return {0, "revoked", 0, 0, 0}
+end
+
+-- 3.5) 密钥换新门（只拦“占新的”，幂等重放在上面已经按同一张单子返回，
+--      因此用旧明文开了头还没结的业务照样能带着原单调完、结完——明文作废
+--      绝不放掉已占额度，也不阻止在飞调用走完）。
+--   * 没换过新（rstat 不存在）：只认签发时那一把，出示别的哈希一律不认；
+--   * 换过新：当前明文随时可占；上一版明文只在说好的宽限时间内、且没被
+--     提前收掉时可占；再老的明文、收掉的、过点的都不能再占新的。
+-- 门只认“这版明文此刻还能不能占新的”，不碰任何计数——新旧两把吃的是逻辑
+-- kid 名下同一份突发/窗口，绝不会各算各的多出一份。
+-- 空 presented_cred 是系统内部路径（主备顶上/业务号路由），不受门限。
+if presented_cred ~= "" then
+  local cur_cred  = redis.call("HGET", rstat_key, "current")
+  if not cur_cred then
+    -- 从没换过新：签发时那把明文的哈希就是 kid
+    if presented_cred ~= kid then
+      return {3, "unknown_credential"}
+    end
+  elseif presented_cred == cur_cred then
+    -- 当前明文：随时可占
+  else
+    local prev_cred = redis.call("HGET", rstat_key, "prev") or ""
+    if presented_cred ~= prev_cred then
+      return {3, "unknown_credential"}
+    end
+    if redis.call("HGET", rstat_key, "prev_state") == "retired" then
+      return {3, "credential_retired"}
+    end
+    local grace_until = tonumber(redis.call("HGET", rstat_key, "grace_until_ms") or "0") or 0
+    if grace_until <= now_ms then
+      return {3, "credential_retired"}
+    end
+  end
 end
 
 -- 主备顶上：主钥因突发/窗口占不住的，先记一笔“连着占不住”（顶上判定由
@@ -486,6 +545,7 @@ redis.call("HSET", res_key,
   "pool_pid", pool_pid,
   "pool_pres", pool_pres,
   "fb_for", fb_role == "backup" and fb_master_kid or "",
+  "cred", identity_cred,
   "outcome", "")
 -- 顶上备钥占成：业务号路由（同一笔永远走第一次占到的那把）与“此刻在顶”
 -- 计数跟备钥占用在同一原子动作里落盘，绝没有“先占主再占备咬住两头”的窗口。
@@ -509,10 +569,12 @@ end
 ledger_add("reserve", res_key, cost, "", false,
            {caller = client, idem = idem, pool = pool,
             reserve_at_ms = now_ms,
-            fb_for = fb_role == "backup" and fb_master_kid or ""})
+            fb_for = fb_role == "backup" and fb_master_kid or "",
+            cred = identity_cred})
 ledger_mirror_primary("reserve", res_key, cost, "", false,
                       {caller = client, idem = idem, pool = pool,
-                       reserve_at_ms = now_ms})
+                       reserve_at_ms = now_ms,
+                       cred = identity_cred})
 -- 占用单留存：带业务号的留 24h（与旧版幂等记录一致），期间同一业务号重放
 -- 都能拿到原结论；匿名单子没人会按号查，留到约定回音时限加宽限即可。
 -- 注意：占用的“额度效力”只到约定回音时限（ZSET score），单子本身留得再久

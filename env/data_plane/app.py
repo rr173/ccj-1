@@ -160,15 +160,36 @@ class StoreUnavailableError(Exception):
     """记额度那层不可用（连接不上 / 重启中 / 只读故障切换）。"""
 
 
+async def resolve_identity(api_key: str) -> tuple[str | None, str | None]:
+    """把调用出示的明文解析成 (逻辑配额身份 kid, 出示明文哈希 cred32)。
+
+    kid = sha256(明文) 前 32 位。密钥换新后新/旧明文哈希下只有一条
+    {qk:<cred32>}rcr 别名指向这把密钥的逻辑 kid（配额/计数/流水都在它名下）；
+    没换过新的密钥没有别名，cred32 本身就是逻辑 kid。
+    返回 (None, cred) 表示配置存在但别名指向的密钥配置已不在（按无效密钥处理）。
+    """
+    cred = keys.key_id(api_key)
+    try:
+        target = await redis_client.get(keys.cred_alias_key(cred))
+    except (aioredis.ConnectionError, aioredis.TimeoutError,
+            aioredis.BusyLoadingError) as exc:
+        raise StoreUnavailableError() from exc
+    return (target or cred, cred)
+
+
 async def reserve_one(effective_kid: str, idem: str, client: str, res_key: str,
                       pid: str = "", pool_res_key: str = "",
                       fb_role: str = "", fb_master_kid: str = "",
-                      fb_route_key: str = "", fb_stats_key: str = "") -> list:
+                      fb_route_key: str = "", fb_stats_key: str = "",
+                      presented_cred: str = "",
+                      identity_cred: str = "") -> list:
     """在一把指定的密钥上完成“密钥自身 + 可选共享池”的占用。
 
     对调用方来说进来的永远是主钥（X-Api-Key），但主备顶上时真正占到的
     可能是备钥——所有后续了结/记账都以实际占到的 effective_kid 为准。
     fb_role/fb_master_kid/fb_route_key/fb_stats_key 是主备顶上才有的参数。
+    presented_cred 是这次请求出示的明文哈希：空串表示系统内部路径
+    （主备顶上/业务号路由），跳过换新门但仍按 identity_cred 归因真用掉。
     """
     try:
         cfg = await redis_client.hgetall(keys.cfg_key(effective_kid))
@@ -202,11 +223,14 @@ async def reserve_one(effective_kid: str, idem: str, client: str, res_key: str,
         fb_master_kid,
         fb_route_key,
         fb_stats_key,
+        presented_cred,
+        identity_cred,
     ]
-    num_keys = 6 if fb_route_key else 5
+    num_keys = 7 if fb_route_key else 6
     lua_keys = [keys.cfg_key(effective_kid), keys.tb_key(effective_kid),
                 keys.shares_key(effective_kid), res_key,
-                keys.ledger_stream_key(effective_kid)]
+                keys.ledger_stream_key(effective_kid),
+                keys.rotation_status_key(effective_kid)]
     if fb_route_key:
         lua_keys.append(fb_route_key)
     try:
@@ -283,7 +307,7 @@ async def reserve_one(effective_kid: str, idem: str, client: str, res_key: str,
 
 
 async def reserve_with_failover(kid: str, idem: str, client: str,
-                                res_key: str) -> tuple[str, str, list]:
+                                res_key: str, cred: str = "") -> tuple[str, str, list]:
     """主备顶上的占用编排，返回 (实际占到的密钥 kid, 实际占用单 key, 结果)。
 
     顺序是硬的：
@@ -296,6 +320,10 @@ async def reserve_with_failover(kid: str, idem: str, client: str,
       4. 备钥也满了，直接把备钥给出的“还要等多久”告诉调用方；
       5. 主钥又能占住以后，新来的自然回到主钥（主钥路径新占成即 streak=0）。
     主钥停用（key_revoked）、备钥停用/解绑、管理性失败都不触发顶上。
+
+    cred 是调用方对外出示的明文哈希（逻辑 kid 已由别名解析得到）：它永远
+    是这一笔记账/换新门的身份；顶上到备钥是系统内部路径，presented 置空
+    （不拿主钥明文去开备钥的换新门），但 identity 仍是调用方出示的那把。
     """
     # 1) 业务号路由：同一笔永远回到第一次占到的那把
     if idem:
@@ -307,7 +335,8 @@ async def reserve_with_failover(kid: str, idem: str, client: str,
         if routed:
             route_res_key = keys.reservation_key(routed, idem)
             return routed, route_res_key, await reserve_one(
-                routed, idem, client, route_res_key)
+                routed, idem, client, route_res_key,
+                presented_cred="", identity_cred=cred)
 
     # 2) 先只占主钥。没绑备钥时 fb_role 为空，行为与旧版完全一致。
     try:
@@ -319,7 +348,8 @@ async def reserve_with_failover(kid: str, idem: str, client: str,
     role = "master" if bkid else ""
     stats_key = keys.failover_stats_key(kid) if bkid else ""
     result = await reserve_one(kid, idem, client, res_key,
-                               fb_role=role, fb_stats_key=stats_key)
+                               fb_role=role, fb_stats_key=stats_key,
+                               presented_cred=cred, identity_cred=cred)
 
     # 3) 只有“这一笔”在主钥额度上占不住才顶上；停用/池停/已了结都不顶
     if int(result[0]) != 0 or result[1] not in {"burst_limited", "window_limited"} \
@@ -348,7 +378,8 @@ async def reserve_with_failover(kid: str, idem: str, client: str,
     bresult = await reserve_one(
         bkid, idem, client, bres_key,
         fb_role="backup", fb_master_kid=kid,
-        fb_route_key=route_key, fb_stats_key=keys.failover_stats_key(kid))
+        fb_route_key=route_key, fb_stats_key=keys.failover_stats_key(kid),
+        presented_cred="", identity_cred=cred)
     # 顶上占成 / 在飞重放 / 备钥也满（报备钥的等待）——都以备钥结果为准
     return bkid, bres_key, bresult
 
@@ -424,10 +455,17 @@ async def handle_proxy(request: web.Request) -> web.Response:
         return _error(401, "missing_api_key", detail="missing X-Api-Key header")
 
     idem = request.headers.get("Idempotency-Key", "")
-    kid = keys.key_id(api_key)
-    # 占用单号：带业务号（Idempotency-Key）时由业务号决定——同一业务号再来，
-    # 命中同一张占用单，绝不二次占额；匿名调用每次一张新单子。
-    # 主备顶上时实际占到的可能是备钥，占用单以“实际那把”的 kid 命名。
+    # 先把出示明文解析成逻辑配额身份：没换过新时 cred==kid；换过新后
+    # {qk:<cred>}rcr 别名把新旧明文都解析到同一逻辑 kid——配额、计数、
+    # 占用单、流水全部以逻辑 kid 为准，新旧明文吃的是同一份突发/窗口。
+    try:
+        kid, cred = await resolve_identity(api_key)
+    except StoreUnavailableError:
+        return _error(503, "quota_store_unavailable", retry_after_ms=2000,
+                      detail="quota store is restarting or unreachable; retry shortly")
+    # 占用单号：带业务号（Idempotency-Key）时由 (逻辑 kid, 业务号) 决定——
+    # 用旧明文占过的同一业务号，换新明文再来命中的还是同一张占用单，
+    # 绝不会被当成另一笔业务再占一次。
     res_key = keys.reservation_key(kid, idem) if idem else keys.reservation_key(kid)
     # 调用方身份：用于同一把密钥内多个租户之间的轮转公平与份额隔离
     client = request.headers.get("X-Client-Id") or (
@@ -436,13 +474,14 @@ async def handle_proxy(request: web.Request) -> web.Response:
     # 同密钥、按调用方轮转：先到先占，但每个请求只占自己的 1 个额度，
     # 任何调用方都不能成批抢光；最终额度由 Redis Lua 原子仲裁，绝不超发。
     # 顶上备钥的请求仍排在主钥的队里（对外只有一把主钥），不在备钥侧另开队列。
+    # 换新后新旧明文属于同一逻辑密钥，仍排在同一把锁的同一队里。
     queue = registry.get(kid)
     if queue is not None:
         await queue.acquire(client)
     try:
         try:
             served_kid, served_res_key, result = await reserve_with_failover(
-                kid, idem, client, res_key)
+                kid, idem, client, res_key, cred=cred or "")
         except StoreUnavailableError:
             # 记额度层重启/不可用：明确告知稍后重试，绝不“放行”也不裸 500
             return _error(503, "quota_store_unavailable", retry_after_ms=2000,
@@ -456,7 +495,14 @@ async def handle_proxy(request: web.Request) -> web.Response:
     on_backup = served_kid != kid
 
     if code == 3:
-        return _error(401, "invalid_api_key", detail=str(result[1]))
+        # 换新门：出示的明文已被收掉/超过说好的宽限时间 → 403；
+        # 出示的明文根本不属于这把密钥（且密钥本体存在）→ 401。
+        reason = str(result[1])
+        if reason == "credential_retired":
+            return _error(403, "api_key_retired",
+                          detail="this API key plaintext was retired (rotation grace "
+                                 "expired or revoked early); use the current plaintext")
+        return _error(401, "invalid_api_key", detail=reason)
 
     if code == 2:
         # 同一业务号再来：返回同一张占用单，绝不二次占额。

@@ -22,6 +22,22 @@ F_RESERVED_BURST = "reserved_burst"
 F_RESERVED_WINDOW = "reserved_window"
 F_STOPPED = "stopped"
 
+# ── 密钥换新（明文轮换，配额身份不变）──────────────────────────────────────
+# 换的是“调用明文”，不是密钥本体：kid = sha256(签发时那把明文) 永远是这把密钥
+# 的配额身份（cfg/tb/win/holds/份额/流水/共享池/主备关系全部挂在它名下）。
+# 新明文的哈希（cred32）只多一条“认证明文 → 配额身份”的别名：
+#   {qk:<cred32>}rcr  string，内容为逻辑 kid（存在即“这把明文被系统认得”）
+#   {qk:<kid>}rstat   hash，换新状态（当前明文/上一版明文/宽限到期/状态）
+# 换新绝不碰任何计数与占用：真用掉不清零，突发/窗口/在飞占用原样共用一份。
+F_ROT_CURRENT = "current"            # 当前明文 cred32
+F_ROT_PREV = "prev"                  # 上一版明文 cred32（宽限期内与当前共用配额）
+F_ROT_PREV_STATE = "prev_state"      # 上一版状态：active / retired（提前收掉）
+F_ROT_GRACE_UNTIL_MS = "grace_until_ms"  # 上一版明文宽限到期（Redis 毫秒时间戳）
+F_ROT_ROTATED_AT_MS = "rotated_at_ms"    # 最近一次换新发生的毫秒时间戳
+
+DEFAULT_ROTATION_GRACE_SECONDS = 86400     # 默认宽限 24h
+MAX_ROTATION_GRACE_SECONDS = 30 * 86400    # 宽限最长 30 天
+
 DEFAULT_RESERVATION_TTL_SECONDS = 60  # 占用约定的回音时限：超时未了结，
                                       # 占着的额度自动退回池里给别人用
 
@@ -177,4 +193,26 @@ def failover_route_key(kid: str, idempotency_key: str) -> str:
     同一业务号再来按路由走第一次那把，绝不换到另一把再占一次。"""
     h = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
     return f"{{qk:{kid}}}fbrt:{h}"
+
+
+# ── 密钥换新（明文轮换）────────────────────────────────────────────────────
+def cred_alias_key(cred: str) -> str:
+    """认证明文哈希（cred32）→ 逻辑配额身份 kid 的别名：string。
+
+    没换过新的密钥没有这把钥匙：数据面直接用 cred32 当 kid 查 cfg，
+    与旧版完全一致；换过新后每版明文（除签发时那把外）都落一条别名，
+    数据面先解析别名再按逻辑 kid 占同一份配额。
+    """
+    return f"{{qk:{cred}}}rcr"
+
+
+def rotation_status_key(kid: str) -> str:
+    """换新状态 hash：{qk:<kid>}rstat（字段见 F_ROT_*）。不存在=没换过新。"""
+    return f"{{qk:{kid}}}rstat"
+
+
+def cred_used_key(kid: str, cred: str) -> str:
+    """某一版明文在这把密钥上“真用掉（已确认、冲正后净额）”的计数。
+    挂在逻辑 kid 的 hash tag 下，settle/reverse 与计数变更同一原子动作维护。"""
+    return f"{{qk:{kid}}}rcu:{cred}"
 

@@ -322,6 +322,18 @@ if resv_pool_pid ~= "" then
   end
 end
 
+-- 这一版明文（密钥换新后“新旧各自真用掉多少”的归因）：以原 confirm 流水
+-- 记录的 cred 为准，老流水没有则取占用单 cred，再没有回退逻辑 kid。
+local rev_cred = conf.f["cred"] or rh["cred"] or ""
+if rev_cred == "" then rev_cred = kid end
+-- 冲回净额：从该版明文的真用掉归因计数里减回同一笔（与计数退回同一原子动作）。
+-- 计数可能已随 rcu key 情况为 0（极老单子），用 max(.,0) 不出现负数归因。
+local rcu_key = "{qk:" .. kid .. "}rcu:" .. rev_cred
+local rcu_old = tonumber(redis.call("GET", rcu_key) or "0") or 0
+if rcu_old > 0 then
+  redis.call("SET", rcu_key, tostring(math.max(rcu_old - amount, 0)))
+end
+
 -- ── 冲正自己留一笔：与上面的计数退回同一原子动作 ──────────────────────────
 local reserve_at = "0"
 if resv then
@@ -342,7 +354,8 @@ local reversal_eid = redis.call("XADD", ledger_key, "*",
   "of", tostring(cost),
   "note", note,
   "pool_pid", pool_pid,
-  "fb_for", mirror_master)
+  "fb_for", mirror_master,
+  "cred", rev_cred)
 local score = tonumber(string.sub(reversal_eid, 1,
   string.find(reversal_eid, "-") - 1)) or now_ms
 if caller ~= "" then
@@ -355,6 +368,13 @@ redis.call("ZADD", lii_key, score, reversal_eid)
 -- 并把“备钥已替主钥真用掉”的累计减回来。计数退回仍只发生在备钥原桶。
 local mirrored = 0
 if mirror_master ~= "" then
+  -- settle.lua 顶上确认时把按明文的真用掉也镜像加了一份到主钥名下，
+  -- 冲正对称地从主钥镜像计数减回（本钥实际计数在上面已经减过）。
+  local mcu = "{qk:" .. mirror_master .. "}rcu:" .. rev_cred
+  local mcu_old = tonumber(redis.call("GET", mcu) or "0") or 0
+  if mcu_old > 0 then
+    redis.call("SET", mcu, tostring(math.max(mcu_old - amount, 0)))
+  end
   local mk = "{qk:" .. mirror_master .. "}ledger"
   local meid = redis.call("XADD", mk, "*",
     "kind", "reversal", "kid", mirror_master,
@@ -371,7 +391,8 @@ if mirror_master ~= "" then
     "pool_pid", pool_pid,
     "fb_for", mirror_master,
     "fbmirror", "1",
-    "fb_key", kid)
+    "fb_key", kid,
+    "cred", rev_cred)
   local mscore = tonumber(string.sub(meid, 1, string.find(meid, "-") - 1)) or now_ms
   if caller ~= "" then
     redis.call("ZADD", "{qk:" .. mirror_master .. "}lci:" .. redis.sha1hex(caller),

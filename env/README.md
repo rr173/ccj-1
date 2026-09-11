@@ -33,6 +33,7 @@
 | 密钥停了流水还在、对账单还能拉 | revoke 只改 cfg.revoked，不碰 Stream/索引；ledger/statement 对 revoked 密钥照常返回；重启后流水随 AOF(appendfsync always) 落盘不丢，两端无需重启自动自愈 |
 | 冲正已真用掉的一笔 | `POST /v1/keys/{kid}/reversals`，`reverse.lua` 原子完成：只能冲**有效密钥**上、**已调成**的那一笔（写明业务号 + 数量）；一笔业务号只能冲一次（重复提交幂等回原结论），冲的数量不能超过那笔当时真用掉的；冲回的量立刻退回原池令牌桶/原窗口桶，**立刻能再占**；冲正自己在只追加流水上留一笔 `reversal`，之后不能改。密钥停用后拒绝新冲正，已冲过的流水/对账单仍可翻 |
 | 多把有效密钥共用一个跨密钥额度池 | `POST /v1/pools` 开池并写明突发/窗口上限；`PUT/DELETE /v1/pools/{pid}/keys/{kid}` 放入/拿出密钥。数据面每次占用必须同时占住“密钥自己的额度”和“池聚合额度”；任一边占不住即拒绝并给 Retry-After。`GET /v1/pools/{pid}` 查池剩余/在池密钥/还占着/真用掉，密钥余量接口也带 `quota_pool` |
+| 密钥换新（换调用明文，不换配额身份） | `POST /v1/keys/{kid}/rotate` 给**还有效**的密钥换新明文，并写明旧明文宽限多久（`grace_seconds`）。宽限期内新旧两把都能占，吃的是这把密钥**同一份**突发/窗口（真用掉不清零、桶不重填）；宽限过点或 `POST /v1/keys/{kid}/rotate/retire` 提前收掉后旧明文不能再占**新的**；用旧明文开了头还没结的在飞单照样结完。`GET /v1/keys/{kid}/quota` 的 `rotation` 节列出此刻哪些明文还能用、旧的还剩多久、新旧各自真用掉多少。同一业务号跨新旧明文命中同一占用单，不二次占；上一档宽限没到不能再换 |
 | Docker 部署 | `docker compose up -d --build`，含 Redis（持久化卷）、控制面、数据面、模拟上游 |
 
 ## 架构
@@ -146,6 +147,8 @@ curl -s -X POST localhost:8000/v1/keys/<kid>/revoke \
 ```bash
 python3 demo/e2e_demo.py            # 基础项
 python3 demo/e2e_demo.py --restart  # 额外重启 Redis 验证 AOF 持久化
+python3 demo/failover_demo.py       # 主备顶上
+python3 demo/rotation_demo.py       # 密钥换新（新旧明文宽限/收掉/停用/幂等）
 ```
 
 ## 限流返回示例
@@ -169,7 +172,8 @@ X-Retry-After-Ms: 400
 
 `code` 取值：`burst_limited`（等令牌补充）、`window_limited`（等旧请求滑出
 长窗口）、`key_revoked`（403）、`invalid_api_key`（401）、
-`missing_api_key`（401）、`quota_store_unavailable`（503，记额度层
+`missing_api_key`（401）、`api_key_retired`（403，出示的旧明文已过换新宽限
+或被提前收掉，需改用当前明文）、`quota_store_unavailable`（503，记额度层
 重启/不可用，带 `Retry-After: 2`，Redis 恢复后自动自愈、无需重启两端）、
 `pool_stopped`（403，跨密钥共享池已停，新占用和在飞确认都不算）、
 `upstream_unavailable`（502，这次没调成，**占着的额度已退回**）、
@@ -205,7 +209,8 @@ Stream `{qk:<kid>}ledger`（entry id 即 Redis 毫秒时间戳），另按调用
 
 每笔流水字段：`kind`（reserve/confirm/release/**reversal**）、`caller`、`idem`、
 `pool`（shared/share）、`cost`、`reason`（release 时 upstream/timeout，冲正为
-reversal）、`late`（约定时限过后才赶到的迟到确认，为 1）、`res`（占用单号）；
+reversal）、`late`（约定时限过后才赶到的迟到确认，为 1）、`res`（占用单号）、
+`cred`（这笔实际出示的明文哈希，换新后用于区分新旧明文各真用掉多少）；
 冲正另有 `of`（被冲那笔当时真用掉的量）、`note`（管理员备注）。
 
 翻流水（控制面，管理员鉴权；时间参数给秒或毫秒都行，end 不含）：
@@ -377,7 +382,10 @@ common/               两端共享的协议（构建时各自打进镜像）
   pool_reserve.lua    数据面：跨密钥共享池的第二道原子占用（密钥+池两边都占住）
   pool_member.lua     控制面：密钥入池/出池，原子保证一把密钥只在一个池
   pool_quota.lua      控制面：只读共享池聚合余量/在占/成员数
-  keys.py             key 规则、hash、配置字段（含 ledger/共享池规则）
+  rotate.lua          控制面：密钥换新——写“明文哈希→逻辑kid”别名与宽限状态，
+                      不清零/不重填；上一档宽限没到拒绝再换
+  rotate_retire.lua   控制面：宽限期没到提前收掉上一版旧明文（在飞单不碰）
+  keys.py             key 规则、hash、配置字段（含 ledger/共享池/换新规则）
   script_runner.py    NOSCRIPT 自动重载 + 连接/LOADING/READONLY 退避重试
 control_plane/        FastAPI：签发/停用/列表/查余量/设份额/冲正/翻流水/拉对账单
   ledger.py           占用流水查询（按密钥+调用方/业务号/时间段）与对账单聚合
@@ -410,6 +418,64 @@ demo/e2e_demo.py      端到端自检
   份额（409）；份额配置保留，余量查询照常返回口径。
 - 取消份额（`DELETE`）后预留立即回到公共池；该调用方已发生的扣减计数原样
   保留（有 TTL 自然过期），不回写、不补偿。
+
+## 密钥换新（换调用明文，不换配额身份）
+
+密钥泄露、定期轮换时，给一把**还有效**的密钥换一把新的调用明文，配额账本
+一笔不动。换的是“认证明文”，不是密钥本体：逻辑 `kid`（=签发时那把明文的
+SHA-256 前 32 位）名下的 cfg / 令牌桶 / 窗口计数 / 占用登记 / 份额 / 流水 /
+共享池 / 主备关系全部原样；新明文只多一条“明文哈希 → 逻辑 kid”的别名
+（`{qk:<cred32>}rcr`）与一份换新状态（`{qk:<kid>}rstat`）。
+
+```bash
+# 换新：写明旧明文还能再用多久（宽限期，秒；默认 24h，最长 30 天）
+curl -s -X POST localhost:8000/v1/keys/<kid>/rotate \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"grace_seconds":86400}'
+# -> {"key_id":"<逻辑kid>","api_key":"qk_新明文（只返回这一次）",
+#     "current_key_id":"<新明文哈希>","previous_key_id":"<上一版明文哈希>",
+#     "grace_until_ms":...}
+
+# 宽限期没到时提前把旧明文收掉（收掉以后旧的不能再占新的）
+curl -s -X POST localhost:8000/v1/keys/<kid>/rotate/retire -H "Authorization: Bearer $ADMIN"
+
+# 查：此刻哪些明文还能用、旧的还剩多久、新旧各自真用掉多少
+curl -s localhost:8000/v1/keys/<kid>/quota -H "Authorization: Bearer $ADMIN"
+```
+
+硬规则（reserve.lua 的换新门与 rotate.lua / rotate_retire.lua 在 Redis
+单线程内原子保证）：
+
+- **换新不清账、不重填**：rotate 只写别名与换新状态，绝不碰令牌桶/窗口计数/
+  占用登记。已经真用掉的还是那些数，突发和窗口也不会被重新装满。
+- **宽限期内新旧共用一份**：两把明文解析到同一个逻辑 kid，占的是同一批
+  holds、扣的是同一个 `tb`/`win:*`，不会“各算各的”多出一份突发或窗口。
+- **过点 / 提前收掉**：宽限时间过了，或管理员在宽限期内 `retire`，旧明文
+  立刻不能再占**新的**（数据面返回 403 `api_key_retired`）；新明文照常。
+- **在飞单不受牵连**：换新门只拦“新占”，幂等判定在它之前。用旧明文开了头
+  还没结的占用（占用单上记着 `cred`），旧明文作废后照样能带着原单调完、
+  确认进同一份计数——**不会因为明文作废就把额度放掉**。
+- **同一业务号不占两次**：占用单以 `(逻辑 kid, 业务号)` 命名，用旧明文占过
+  的业务号换新明文再来命中同一张单子，按原结论 409，绝不当成另一笔再占。
+- **上一档宽限没到不能再换**：`rotate` 返回 409 `rotation_in_grace` 并带上
+  `grace_until_ms`；等宽限自然到期，或先 `retire` 提前收掉旧明文，才能再换。
+  再换后更早那把明文不再认得（无别名 → 401 `invalid_api_key`）。
+- **密钥停了新旧都停**：revoked 检查在换新门之前，密钥停用后新旧明文、任何
+  版本都不能再占新的；停用的密钥也不能再换新（409）。
+- **没换过的只认签发时那一把**：没有换新状态时出示别的哈希一律无效（401）。
+- **各自真用掉可查、余量仍是一份**：`rotation.credentials[]` 给出每版明文的
+  `state`（current/grace/retired/expired）、`usable`、`grace_remaining_ms`、
+  `consumed`（确认时按占用单的 `cred` 归因到该版明文，冲正同步减回净额；
+  顶上备钥确认的归因与流水一起镜像回主钥）。顶层 `burst/window` 的
+  可再占/还占着/真用掉仍是这把密钥的一份总数，不因换新而拆分。
+- **流水带明文版本**：reserve/confirm/release/reversal 每笔流水都有
+  `cred` 字段（该笔实际出示的明文哈希），翻流水时以 `credential_id` 返回，
+  可核对某版明文发生过哪些调用。换新、收掉都不删任何历史流水。
+
+> 换新只支持“签发时那把 → 新一版 → 再下一版”的线性轮换，同一时刻只有
+> “当前 + 上一版（宽限内）”两把明文能占新的；更早版本的别名保留可审计，
+> 但不再认得。换新/收掉的管理脚本与共享池一样会访问同一逻辑密钥 tag 下的
+> 别名 key（`{qk:<cred32>}rcr`），适用于单机/主从 Redis。
 
 ## 跨密钥共享额度池
 

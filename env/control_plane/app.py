@@ -35,6 +35,8 @@ _REVERSE_SRC = (COMMON_DIR / "reverse.lua").read_text(encoding="utf-8")
 _POOL_QUOTA_SRC = (COMMON_DIR / "pool_quota.lua").read_text(encoding="utf-8")
 _POOL_MEMBER_SRC = (COMMON_DIR / "pool_member.lua").read_text(encoding="utf-8")
 _FAILOVER_MEMBER_SRC = (COMMON_DIR / "failover_member.lua").read_text(encoding="utf-8")
+_ROTATE_SRC = (COMMON_DIR / "rotate.lua").read_text(encoding="utf-8")
+_ROTATE_RETIRE_SRC = (COMMON_DIR / "rotate_retire.lua").read_text(encoding="utf-8")
 # SHA 放在可变 dict 里：Redis 重启清空脚本缓存后由 script_runner 刷新，
 # 无需重启本进程
 _quota_sha: dict = {"sha": None}
@@ -43,6 +45,8 @@ _reverse_sha: dict = {"sha": None}
 _pool_quota_sha: dict = {"sha": None}
 _pool_member_sha: dict = {"sha": None}
 _failover_member_sha: dict = {"sha": None}
+_rotate_sha: dict = {"sha": None}
+_rotate_retire_sha: dict = {"sha": None}
 
 
 def quota_eval(cfg_key_: str, tb_key_: str, shares_key_: str, *argv) -> tuple:
@@ -88,6 +92,20 @@ def failover_member_eval(kid: str, bkid: str, action: str) -> list:
         [keys.failover_backup_key(kid), keys.failover_master_key(bkid),
          keys.cfg_key(kid), keys.cfg_key(bkid),
          action, kid, bkid])
+
+
+def rotate_eval(kid: str, newcred: str, grace_seconds: int) -> list:
+    return run_script_sync(
+        r, _ROTATE_SRC, _rotate_sha, 3,
+        [keys.cfg_key(kid), keys.rotation_status_key(kid),
+         keys.cred_alias_key(newcred),
+         kid, newcred, grace_seconds])
+
+
+def rotate_retire_eval(kid: str) -> list:
+    return run_script_sync(
+        r, _ROTATE_RETIRE_SRC, _rotate_retire_sha, 1,
+        [keys.rotation_status_key(kid), kid])
 
 
 app = FastAPI(title="quota-control-plane", version="1.0.0")
@@ -151,6 +169,19 @@ class ReverseRequest(BaseModel):
     idem_key: str = Field(min_length=1, max_length=256, description="被冲正的业务号")
     amount: int = Field(gt=0, description="冲回数量，不得超过该笔当时真用掉的")
     note: str = Field(default="", max_length=512, description="备注，随流水留档")
+
+
+class RotateRequest(BaseModel):
+    """密钥换新：给一把还有效的密钥换一把新的调用明文。
+
+    - grace_seconds 写明旧明文还能再用多久（新旧并行的宽限时间）；
+    - 换新不动任何计数：已真用掉不清零，突发/窗口/在飞占用原样共用一份；
+    - 上一档换新的宽限时间还没到（且旧明文没被提前收掉）时不能再换。
+    """
+    grace_seconds: int = Field(
+        default=keys.DEFAULT_ROTATION_GRACE_SECONDS, gt=0,
+        le=keys.MAX_ROTATION_GRACE_SECONDS,
+        description="旧明文宽限期（秒）：这段时间新旧明文都能占，吃同一份配额")
 
 
 def require_admin(authorization: Optional[str] = Header(default=None)) -> None:
@@ -223,6 +254,150 @@ def revoke_key(kid: str) -> dict:
     except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as exc:
         raise QuotaStoreUnavailable() from exc
     return {"key_id": kid, "revoked": True}
+
+
+def _credential_view(kid: str, cred: str, now_ms: int, rstat: dict,
+                     role: str, grace_until_ms: int = 0) -> dict:
+    """组装某一版明文的状态：还能不能占新的、还剩多久、各自真用掉多少。"""
+    used = int(r.get(keys.cred_used_key(kid, cred)) or 0)
+    if role == "current":
+        usable = True
+        remaining_ms = None
+        state = "current"
+    else:
+        retired = rstat.get(keys.F_ROT_PREV_STATE) == "retired"
+        expired = grace_until_ms <= now_ms
+        usable = not retired and not expired
+        remaining_ms = max(0, grace_until_ms - now_ms) if usable else 0
+        state = "retired" if retired else ("expired" if expired else "grace")
+    return {
+        "key_id": cred,
+        "state": state,
+        "usable": usable,
+        "grace_remaining_ms": remaining_ms,
+        "consumed": used,
+    }
+
+
+def _rotation_view(kid: str) -> Optional[dict]:
+    """只读组装换新状态：此刻哪些明文还能用、旧的还剩多久、新旧各真用掉多少。
+
+    余量不在这一节另算——新旧明文吃的是逻辑密钥同一份突发/窗口，以同响应
+    里的顶层 burst/window（可再占/还占着/真用掉）为准，这里只列按明文归因的
+    真用掉与各明文的可用状态。没换过新返回 None（只认签发时那一把）。
+    """
+    rstat_key = keys.rotation_status_key(kid)
+    if not r.exists(rstat_key):
+        return None
+    t_sec, t_usec = r.time()
+    now_ms = int(t_sec) * 1000 + int(t_usec) // 1000
+    rstat = r.hgetall(rstat_key)
+    current = rstat.get(keys.F_ROT_CURRENT, kid)
+    prev = rstat.get(keys.F_ROT_PREV, "")
+    grace_until_ms = int(rstat.get(keys.F_ROT_GRACE_UNTIL_MS, "0") or 0)
+    rotated_at_ms = int(rstat.get(keys.F_ROT_ROTATED_AT_MS, "0") or 0)
+    credentials = [_credential_view(kid, current, now_ms, rstat, "current")]
+    if prev:
+        credentials.append(_credential_view(kid, prev, now_ms, rstat, "previous",
+                                            grace_until_ms))
+    usable = [c["key_id"] for c in credentials if c["usable"]]
+    return {
+        "rotated": True,
+        "rotated_at_ms": rotated_at_ms,
+        "current_key_id": current,
+        "previous_key_id": prev or None,
+        "grace_until_ms": grace_until_ms or None,
+        "usable_key_ids": usable,
+        "credentials": credentials,
+    }
+
+
+@app.post("/v1/keys/{kid}/rotate", status_code=201,
+          dependencies=[Depends(require_admin)])
+def rotate_key(kid: str, body: RotateRequest) -> dict:
+    """密钥换新：给一把还有效的密钥换一把新的调用明文。
+
+    换的是认证明文，不是配额身份——已真用掉不清零，突发/窗口不重填，
+    新旧明文在宽限期内吃同一份突发/窗口（见 README“密钥换新”）。
+    上一档换新说好的宽限时间还没到（且旧明文没被提前收掉）时返回 409
+    rotation_in_grace；密钥停用/不存在同样拒绝。
+    """
+    cfg = _load_config(kid)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="key not found")
+    new_api_key = keys.new_api_key()
+    newcred = keys.key_id(new_api_key)
+    try:
+        res = rotate_eval(kid, newcred, body.grace_seconds)
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    if int(res[0]) != 1:
+        reason = res[1]
+        if reason == "key not found":
+            raise HTTPException(status_code=404, detail="key not found")
+        if reason == "revoked":
+            raise HTTPException(status_code=409, detail={
+                "code": "key_revoked",
+                "message": "key is revoked; only active keys can be rotated",
+            })
+        if reason == "grace_active":
+            raise HTTPException(status_code=409, detail={
+                "code": "rotation_in_grace",
+                "message": "previous rotation's grace period has not ended; "
+                           "wait it out or retire the old plaintext early",
+                "previous_key_id": res[2],
+                "grace_until_ms": int(res[3]),
+            })
+        if reason == "credential_in_use":
+            raise HTTPException(status_code=409, detail={
+                "code": "credential_in_use",
+                "message": "generated plaintext collides with an existing credential",
+            })
+        raise HTTPException(status_code=400, detail=str(reason))
+    _, current_cred, prev_cred, grace_until_ms, rotated_at_ms = res[:5]
+    return {
+        "key_id": kid,
+        "api_key": new_api_key,  # 新明文只返回这一次
+        "rotated_at_ms": int(rotated_at_ms),
+        "current_key_id": current_cred,
+        "previous_key_id": prev_cred,
+        "grace_seconds": body.grace_seconds,
+        "grace_until_ms": int(grace_until_ms),
+    }
+
+
+@app.post("/v1/keys/{kid}/rotate/retire", dependencies=[Depends(require_admin)])
+def retire_previous_plaintext(kid: str) -> dict:
+    """说好的宽限时间还没到时，提前把上一版旧明文收掉。
+
+    收掉以后旧明文立刻不能再占新的；但用旧明文开了头还没结的在飞占用不碰，
+    照样能结完（settle 不看换新状态），已占额度不会因为明文作废被放掉。
+    """
+    cfg = _load_config(kid)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="key not found")
+    try:
+        res = rotate_retire_eval(kid)
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    code = int(res[0])
+    if code in (1, 2):
+        _, prev_cred, grace_until_ms = res[:3]
+        return {
+            "key_id": kid,
+            "previous_key_id": prev_cred,
+            "retired": True,
+            "already_inactive": code == 2,
+            "grace_until_ms": int(grace_until_ms),
+        }
+    if res[1] == "not found":
+        raise HTTPException(status_code=404, detail={
+            "code": "no_rotation",
+            "message": "key was never rotated; there is no previous plaintext to retire",
+        })
+    raise HTTPException(status_code=400, detail=str(res[1]))
 
 
 def _load_pool(pid: str) -> Optional[dict]:
@@ -612,10 +787,17 @@ def get_quota(kid: str) -> dict:
     except redis.exceptions.RedisError:
         fbk = None
 
+    try:
+        rotation = _rotation_view(kid)
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+
     return {
         "key_id": kid,
         "state": state,
         "failover": {"bound": bool(fbk), "backup_key_id": fbk or None},
+        "rotation": rotation if rotation is not None else {"rotated": False},
         "burst": {**total["burst"],
                   "refill_per_second": round(1000.0 / refill_ms, 3) if refill_ms > 0 else None},
         "window": {"seconds": int(win_s), **total["window"]},

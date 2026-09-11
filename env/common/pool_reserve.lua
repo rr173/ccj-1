@@ -81,7 +81,8 @@ local function append_key_timeout(kid_val, rkey, fields, cost_val)
     "reason", "timeout",
     "late", "0",
     "reserve_at", fields.reserve_at or "0",
-    "pool_pid", pid)
+    "pool_pid", pid,
+    "cred", fields.cred or "")
   local score = tonumber(string.sub(eid, 1, string.find(eid, "-") - 1)) or now_ms
   local caller = fields.caller or ""
   if caller ~= "" then
@@ -121,8 +122,10 @@ local function finalize_expired_pair(rkey)
       if kf[4] and kf[4] ~= "" then redis.call("ZREM", kf[4], unpack(kmm)) end
       if kf[5] and kf[5] ~= "" then redis.call("ZREM", kf[5], unpack(kmm)) end
       redis.call("HSET", kr, "outcome", "expired")
+      local kcred = redis.call("HGET", kr, "cred") or ""
       append_key_timeout(f[6], kr,
-        {caller = f[7] or "", idem = f[8] or "", reserve_at = f[9] or "0"},
+        {caller = f[7] or "", idem = f[8] or "", reserve_at = f[9] or "0",
+         cred = kcred},
         kcost)
     end
   end
