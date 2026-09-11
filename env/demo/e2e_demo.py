@@ -604,6 +604,39 @@ def t_ledger_and_statement() -> None:
     th.join()
     record("慢调用最终成功并补确认", done and done[0][0] == 200, f"{done}")
 
+    # 10g2. 一笔先超时退回、后迟到调成的单：只能算真用掉，不能又算退回
+    kid3, key3 = issue_key("ledger-late", burst=10, refill_ms=100000,
+                           win_s=300, win_q=100)
+    # 数据面 lease=5s（compose/demo 约定）；8s 的慢调用先超时退回再迟到确认
+    st_late = http("GET", f"{DP}/slow?ms=8000",
+                   {"X-Api-Key": key3, "Idempotency-Key": "L-late"})
+    record("迟到场景：慢调用最终 200（先超时退回、后确认）",
+           st_late[0] == 200, f"status={st_late[0]}")
+    ev_late = ledger(kid3, "idem_key=L-late&order=asc")
+    record("流水如实留三笔（reserve / release-timeout / confirm-late），不可改",
+           [(e["kind"], e["reason"]) for e in ev_late["events"]]
+           == [("reserve", ""), ("release", "timeout"), ("confirm", "")]
+           and ev_late["events"][2]["late"] is True,
+           json.dumps([(e["kind"], e["reason"], e["late"])
+                       for e in ev_late["events"]], ensure_ascii=False))
+    st3 = statement(kid3, t0 - 60, int(time.time()) + 60)
+    t3 = st3["totals"]
+    ok_merge = (t3["reserved"] == 1 and t3["confirmed"] == 1
+                and t3["confirmed_late"] == 1 and t3["released"] == 0
+                and t3["released_timeout"] == 0 and t3["held_pending"] == 0)
+    record("同一单最终调成：只算真用掉 1，绝不又算退回（不双算）",
+           ok_merge, json.dumps(t3, ensure_ascii=False))
+    rec3 = st3["reconciliation"]
+    record("迟到单：流水真用掉与 win 计数仍对得上（1=1）",
+           rec3["matched"] is True and rec3["ledger_confirmed"] == 1
+           and rec3["counter_consumed"] == 1,
+           json.dumps({k: rec3[k] for k in
+                       ("matched", "ledger_confirmed", "counter_consumed")},
+                      ensure_ascii=False))
+    # 互斥合计恒等式：占过 = 真用掉 + 退回 + 还占着
+    assert t3["reserved"] == (t3["confirmed"] + t3["released"]
+                              + t3["held_pending"]), t3
+
     # 10h. 对不上时两边数都亮出：在真有调用的密钥上制造计数差异。
     # 正常路径数据面与计数在同一 Lua 内一致，这里直接改 win 桶模拟
     # “余量计数与流水不一致”（如人工修数/迁移），statement 必须两边都亮。

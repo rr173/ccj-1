@@ -216,6 +216,11 @@ curl -s "localhost:8000/v1/keys/<kid>/ledger?start=1789000000&end=1789003600" -H
 
 - `totals.reserved/confirmed/released`：这段**占过多少、真用掉多少、退回多少**
   （`released_upstream`=没调成即时退，`released_timeout`=过约定时限没回音自动退）；
+  对账单按**占用单的最终结局归并**，不是逐笔流水累加，因此三类互斥且
+  `reserved = confirmed + released + held_pending`：一笔单只要最终调成
+  （哪怕先超时退回过、之后迟到确认），只计入 `confirmed`（迟到量单列
+  `confirmed_late`），**绝不再计入退回**；只有最终没调成的才计入 `released`；
+  拉账单时还没结局的计入 `held_pending`；
 - `held_open`：**还占着的单独列**（区间内占的 `items_in_range`、更早挂过来的
   `items_carried` 分开），这些不计入真用掉；
 - `reconciliation`：流水侧真用掉（区间对齐到固定窗口桶后的 confirm 合计）与
@@ -231,6 +236,10 @@ curl -s "localhost:8000/v1/keys/<kid>/ledger?start=1789000000&end=1789003600" -H
 迟到的真实回音随后赶到，仍把单子推进为 confirmed 并补一笔 `confirm(late=1)`
 （宁可在占时保守、也不丢真实调用）；同一业务号在超时退回后再来返回 409
 `idempotent_replay_timeout`，换新业务号才能再试。
+
+> 流水是事实：同一单的 `release(timeout)` 与迟到的 `confirm(late)` 两笔都保留、
+> 都不能改；对账单只负责按最终结局归并展示。控制面向后补结局的宽限窗由
+> `SETTLE_LOOKAHEAD_MS`（默认 300000ms）控制，需大于回音时限 `RESERVATION_TTL_SECONDS`。
 
 ## 公平性的边界（如实说明）
 

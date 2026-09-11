@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import redis
@@ -23,6 +24,13 @@ from common import keys
 MAX_SCAN = 10000
 PAGE_DEFAULT = 500
 PAGE_MAX = 2000
+
+# 对账单按“占用单的最终结局”归并：一笔单若先超时退回、之后迟到确认，
+# 最终只能算真用掉，不能再算退回。区间结尾附近占的单，其结局事件可能落在
+# 区间之后；拉账单时向后多扫这么久，把这些单的最终结局补齐（仅用于归并，
+# 不改变流水事实，也不把区间外的占用计入）。默认 5 分钟，需大于
+# RESERVATION_TTL_SECONDS（生产默认 60s）；数据面在飞调用最长 30s + lease。
+SETTLE_LOOKAHEAD_MS = int(os.environ.get("SETTLE_LOOKAHEAD_MS", "300000"))
 
 
 def now_ms(r: redis.Redis) -> int:
@@ -277,42 +285,105 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
     now = now_ms(r)
     stream = keys.ledger_stream_key(kid)
 
-    totals = {
-        "reserved": 0,
-        "confirmed": 0,
-        "confirmed_late": 0,
-        "released": 0,
-        "released_upstream": 0,
-        "released_timeout": 0,
-    }
-    by_pool = {"shared": {"reserved": 0, "confirmed": 0, "released": 0},
-               "share": {"reserved": 0, "confirmed": 0, "released": 0}}
-    events_matched = 0
+    # ── 按占用单归并，而不是逐笔流水累加 ──
+    # 一笔单在流水里可能有 1~3 个事件：
+    #   reserve；reserve + confirm（调成）；
+    #   reserve + release（没调成）；
+    #   reserve + release(timeout) + confirm(late=1)（先超时退回、之后迟到调成）。
+    # 对账单以单子的【最终结局】归类：
+    #   有 confirm（含迟到）  → 只算真用掉，绝不进退回；
+    #   只有 release          → 只算退回；
+    #   都没有                → 还占着（pending，与 held_open 分列口径一致）。
+    # 这样“已调成的不会又算进退回”，三类互斥且完备。
+    units: dict[str, dict] = {}
 
+    def ingest(rid: str, fields: dict) -> None:
+        u = units.get(rid)
+        if u is None:
+            u = {"cost": 1, "pool": "shared", "caller": "",
+                 "reserved_at": 0, "confirmed": False, "late": False,
+                 "released": False, "reasons": set(), "in_range": False}
+            units[rid] = u
+        u["cost"] = int(fields.get("cost", "1") or "1")
+        u["pool"] = fields.get("pool") or u["pool"]
+        u["caller"] = fields.get("caller", "")
+        kind = fields.get("kind", "")
+        if kind == "reserve":
+            u["reserved_at"] = int(fields.get("reserve_at", "0") or 0)
+        elif kind == "confirm":
+            u["confirmed"] = True
+            if fields.get("late") == "1":
+                u["late"] = True
+        elif kind == "release":
+            u["released"] = True
+            u["reasons"].add(fields.get("reason") or "upstream")
+
+    # 1) 区间内的流水：归属本账单（按 reserve 落在区间内）
     for eid, f in _iter_stream(r, stream, start_ms, end_ms):
         if caller and f.get("caller", "") != caller:
             continue
-        kind = f.get("kind", "")
-        cost = int(f.get("cost", "1") or "1")
-        pool = f.get("pool", "shared")
-        bucket = by_pool.setdefault(
-            pool, {"reserved": 0, "confirmed": 0, "released": 0})
-        events_matched += 1
-        if kind == "reserve":
-            totals["reserved"] += cost
-            bucket["reserved"] += cost
-        elif kind == "confirm":
-            totals["confirmed"] += cost
-            bucket["confirmed"] += cost
-            if f.get("late") == "1":
-                totals["confirmed_late"] += cost
-        elif kind == "release":
-            totals["released"] += cost
-            bucket["released"] += cost
-            if f.get("reason") == "timeout":
-                totals["released_timeout"] += cost
+        rid = f.get("res", "")
+        ingest(rid, f)
+        if f.get("kind") == "reserve":
+            units[rid]["in_range"] = True
+
+    # 2) 向后多看一个宽限窗，只为补齐“区间结尾刚占、结局落在区间外”的单的
+    #    最终结局。只补区间内还【没有结局】的单（只有 reserve）：
+    #      * 已在区间内终结的单（含 timeout release）以区间内结局为准，
+    #        绝不用区间外之后发生的事件翻案——历史时点的账不能被未来改写；
+    #      * pending 单调向终态（结局之后不会再变），补到 confirm/release
+    #        即是最终结局，迟到 confirm 也因此能盖过它之前的 timeout release。
+    look_end = min(end_ms + SETTLE_LOOKAHEAD_MS, now)
+    if look_end > end_ms:
+        for eid, f in _iter_stream(r, stream, end_ms, look_end):
+            if caller and f.get("caller", "") != caller:
+                continue
+            rid = f.get("res", "")
+            u = units.get(rid)
+            if u is not None and not u["confirmed"] and not u["released"]:
+                ingest(rid, f)
+
+    totals = {
+        "reserved": 0,          # 这段占过的（= 确认 + 退回 + 还占着，互斥合计）
+        "confirmed": 0,         # 真用掉（最终调成的，含迟到确认）
+        "confirmed_late": 0,    #   其中：先超时退回、后迟到调成的
+        "released": 0,          # 退回（最终没调成的；已调成的永不进这里）
+        "released_upstream": 0,
+        "released_timeout": 0,
+        "held_pending": 0,      # 还占着没回音的（区间内占、拉账单时仍未结局）
+    }
+    by_pool: dict[str, dict] = {}
+
+    def pool_bucket(pool: str) -> dict:
+        return by_pool.setdefault(pool, {
+            "reserved": 0, "confirmed": 0, "released": 0, "held": 0})
+
+    for rid, u in units.items():
+        if not u["in_range"]:
+            continue
+        b = pool_bucket(u["pool"])
+        c = u["cost"]
+        totals["reserved"] += c
+        b["reserved"] += c
+        if u["confirmed"]:
+            # 最终调成：只算真用掉；即使流水里早先有 release(timeout)，
+            # 也绝不再算进退回。
+            totals["confirmed"] += c
+            b["confirmed"] += c
+            if u["late"]:
+                totals["confirmed_late"] += c
+        elif u["released"]:
+            # 最终没调成：只算退回（最终结局是 release，再细分原因）
+            totals["released"] += c
+            b["released"] += c
+            if "timeout" in u["reasons"]:
+                totals["released_timeout"] += c
             else:
-                totals["released_upstream"] += cost
+                totals["released_upstream"] += c
+        else:
+            # 宽限窗内仍没看到结局：算还占着（held_open 另有明细）
+            totals["held_pending"] += c
+            b["held"] += c
 
     held = _held_open(r, kid, now, start_ms, end_ms)
     if caller:
@@ -427,7 +498,9 @@ def build_statement(r: redis.Redis, kid: str, cfg: dict, *,
         "generated_at_ms": now,
         "range": {"start_ms": start_ms, "end_ms": end_ms},
         "filters": {"caller": caller or None},
-        "events_matched": events_matched,
+        # 归并到的占用单笔数（一笔单可能对应多笔流水事件）
+        "reservations_matched": sum(1 for u in units.values() if u["in_range"]),
+        "settle_lookahead_ms": SETTLE_LOOKAHEAD_MS,
         "totals": totals,
         "by_pool": by_pool,
         "held_open": {
