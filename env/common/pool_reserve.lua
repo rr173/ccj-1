@@ -96,6 +96,49 @@ local function append_key_timeout(kid_val, rkey, fields, cost_val)
   end
 end
 
+-- 池侧先发现密钥配对单超时：按超时记一笔调用方熔断失败，逻辑与 sweep.lua 一致。
+local function apply_circuit_timeout(owner, caller, res_gen, is_probe, res_id)
+  if not owner or owner == "" or not caller or caller == "" then return end
+  local ch = redis.sha1hex(caller)
+  local policy_key = "{qk:" .. owner .. "}cbcfg"
+  local state_key = "{qk:" .. owner .. "}cb:" .. ch
+  local callers_key = "{qk:" .. owner .. "}cbci"
+  if redis.call("HGET", policy_key, "enabled") ~= "1" then return end
+  local threshold = tonumber(redis.call("HGET", policy_key, "failure_threshold") or "0") or 0
+  local cooldown = tonumber(redis.call("HGET", policy_key, "cooldown_ms") or "0") or 0
+  if threshold <= 0 or cooldown <= 0 then return end
+  local flat = redis.call("HGETALL", state_key)
+  local st = {}
+  for i = 1, #flat, 2 do st[flat[i]] = flat[i + 1] end
+  local gen = st.gen or "0"
+  redis.call("HSET", callers_key, ch, caller)
+  local function reopen(next_gen)
+    local until_ms = now_ms + cooldown
+    redis.call("HSET", state_key,
+      "state", "open", "gen", tostring(next_gen),
+      "failures", tostring(threshold), "probe", "0", "probe_id", "",
+      "opened_at_ms", now_ms, "open_until_ms", until_ms,
+      "last_failure_at_ms", now_ms)
+    redis.call("PEXPIRE", state_key, cooldown + 86400000)
+  end
+  if is_probe then
+    if st.state == "half_open" and gen == tostring(res_gen or gen)
+       and (not res_id or res_id == "" or st.probe_id == res_id) then
+      reopen(tonumber(gen or "0") + 1)
+    end
+    return
+  end
+  if st.state ~= "closed" or gen ~= tostring(res_gen or gen) then return end
+  local failures = tonumber(st.failures or "0") + 1
+  if failures >= threshold then
+    reopen(tonumber(gen or "0") + 1)
+  else
+    redis.call("HSET", state_key, "failures", tostring(failures),
+               "last_failure_at_ms", now_ms)
+    redis.call("PEXPIRE", state_key, 86400000)
+  end
+end
+
 -- 池侧单子超时：释放池占用；若它记录了配对的密钥侧单子，且那张单子也未了结、
 -- 已到时限，就一起释放。两张单子的时限由同一次请求写入，正常同时到期。
 local function finalize_expired_pair(rkey)
@@ -114,7 +157,9 @@ local function finalize_expired_pair(rkey)
   local kr = f[10] or ""
   if kr ~= "" and redis.call("EXISTS", kr) == 1 then
     local kf = redis.call("HMGET", kr, "outcome", "lease_exp_ms", "cost",
-                          "holds", "wholds")
+                          "holds", "wholds", "caller", "cb_owner", "cb_gen",
+                          "cb_probe")
+    local kcaller = kf[6] or ""
     local kexp = tonumber(kf[2] or "0") or 0
     if kf[1] == "" and kexp <= now_ms then
       local kcost = tonumber(kf[3] or "1") or 1
@@ -122,6 +167,8 @@ local function finalize_expired_pair(rkey)
       if kf[4] and kf[4] ~= "" then redis.call("ZREM", kf[4], unpack(kmm)) end
       if kf[5] and kf[5] ~= "" then redis.call("ZREM", kf[5], unpack(kmm)) end
       redis.call("HSET", kr, "outcome", "expired")
+      apply_circuit_timeout(kf[7] or f[6], kcaller, kf[8] or "0",
+                            kf[9] == "1", kr)
       local kcred = redis.call("HGET", kr, "cred") or ""
       append_key_timeout(f[6], kr,
         {caller = f[7] or "", idem = f[8] or "", reserve_at = f[9] or "0",

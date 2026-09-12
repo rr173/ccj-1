@@ -63,6 +63,9 @@
 --                        （主备顶上时 presented_cred 为空，identity 仍是调用方
 --                        出示的主钥明文）；占用单 cred 字段/各明文真用掉计数
 --                        都按它归属。缺省回退 presented_cred，再缺省回退 kid。
+--  18 cb_owner          按调用方熔断状态归属的逻辑密钥；普通路径=kid，
+--                        备钥顶上时=主钥 kid。熔断只按调用方阻断其本人，
+--                        绝不因为某调用方断了而停掉整把密钥。
 --
 -- 返回（全部为整/字符串数组）：
 --   {1, remaining_burst, remaining_window, lease_expires_unix}        占成功
@@ -110,6 +113,7 @@ local fb_route_key    = ARGV[14] or ""
 local fb_stats_key    = ARGV[15] or ""
 local presented_cred  = ARGV[16] or ""
 local identity_cred   = ARGV[17] or presented_cred or ""
+local cb_owner        = ARGV[18] or kid
 if identity_cred == "" then identity_cred = kid end
 
 if not capacity or not refill_ms or not window_seconds or not window_quota
@@ -122,6 +126,58 @@ end
 local t          = redis.call("TIME")
 local now_ms     = t[1] * 1000 + math.floor(t[2] / 1000)
 local now_us     = t[1] * 1000000 + t[2]
+
+-- 真实调用失败 / 约定时限内没回音时推进熔断状态。普通在飞调用只认它占住时
+-- 那一代；失败期间熔断已被别的失败打开/重开（gen 已变）后，旧调用不再改状态。
+local function apply_circuit_failure(owner, caller, res_gen, res_probe, at_ms, res_id)
+  if not owner or owner == "" or not caller or caller == "" then return end
+  local ch = redis.sha1hex(caller)
+  local policy = "{qk:" .. owner .. "}cbcfg"
+  local state_key = "{qk:" .. owner .. "}cb:" .. ch
+  local callers_key = "{qk:" .. owner .. "}cbci"
+  if redis.call("HGET", policy, "enabled") ~= "1" then return end
+  local flat = redis.call("HGETALL", state_key)
+  local st = {}
+  for i = 1, #flat, 2 do st[flat[i]] = flat[i + 1] end
+  local threshold = tonumber(redis.call("HGET", policy, "failure_threshold") or "0") or 0
+  local cooldown = tonumber(redis.call("HGET", policy, "cooldown_ms") or "0") or 0
+  local gen = st.gen or "0"
+  local is_probe = res_probe == "1" or res_probe == true
+  if threshold <= 0 or cooldown <= 0 then return end
+  redis.call("HSET", callers_key, ch, caller)
+
+  local function open_circuit(new_gen)
+    local until_ms = at_ms + cooldown
+    redis.call("HSET", state_key,
+      "state", "open", "gen", tostring(new_gen),
+      "failures", tostring(threshold),
+      "open_until_ms", until_ms,
+      "opened_at_ms", at_ms,
+      "probe", "0",
+      "probe_id", "",
+      "last_failure_at_ms", at_ms)
+    redis.call("PEXPIRE", state_key, cooldown + 86400000)
+  end
+
+  if is_probe then
+    if st.state == "half_open" and gen == tostring(res_gen or gen)
+       and (res_id == "" or st.probe_id == res_id) then
+      open_circuit(tonumber(gen or "0") + 1)
+    end
+    return
+  end
+
+  if st.state ~= "closed" or gen ~= tostring(res_gen or gen) then return end
+  local failures = tonumber(st.failures or "0") + 1
+  if failures >= threshold then
+    open_circuit(tonumber(gen or "0") + 1)
+  else
+    redis.call("HSET", state_key,
+      "state", "closed", "failures", tostring(failures),
+      "last_failure_at_ms", at_ms)
+    redis.call("PEXPIRE", state_key, 86400000)
+  end
+end
 
 -- 1) 配置存在性：控制面写入；数据面只读。
 if redis.call("EXISTS", cfg_key) == 0 then
@@ -203,7 +259,7 @@ local function finalize_expired(rkey)
   local f = redis.call("HMGET", rkey, "outcome", "lease_exp_ms", "cost",
                        "holds", "wholds", "caller", "idem", "pool",
                        "reserved_at_ms", "pool_pid", "pool_pres", "fb_for",
-                       "cred")
+                       "cred", "cb_owner", "cb_gen", "cb_probe")
   local fo = f[1]
   if not fo or fo ~= "" then
     return false
@@ -224,6 +280,8 @@ local function finalize_expired(rkey)
     redis.call("ZREM", f[5], unpack(members))
   end
   redis.call("HSET", rkey, "outcome", "expired")
+  apply_circuit_failure(f[14] or kid, f[6] or "", f[15] or "0",
+                        f[16] or "0", now_ms, rkey)
   ledger_add("release", rkey, cost_val, "timeout", false,
              {caller = f[6] or "", idem = f[7] or "", pool = f[8] or "",
               reserve_at_ms = f[9] or "0", fb_for = f[12] or "",
@@ -354,10 +412,103 @@ if presented_cred ~= "" then
   end
 end
 
+-- 按调用方熔断：配置在 cbcfg，状态在 cb:<sha1(caller)>。熔断状态不在此处
+-- 按“实际上游结果”改变——实际失败/超时由 settle.lua、超时兜底由 sweep/本
+-- 脚本 finalize_expired 记账；这里只负责放行，并在冷静时间到点时原子地放出
+-- 唯一一笔试探。
+local cb_policy_key = "{qk:" .. cb_owner .. "}cbcfg"
+local cb_ch = client ~= "" and redis.sha1hex(client) or ""
+local cb_state_key = cb_ch ~= "" and ("{qk:" .. cb_owner .. "}cb:" .. cb_ch) or ""
+local cb_callers_key = cb_ch ~= "" and ("{qk:" .. cb_owner .. "}cbci") or ""
+local cb_gen = "0"
+local cb_probe = false
+local cb_admit_owner = ""
+
+local function circuit_open_response(retry_ms, streak)
+  if retry_ms < 1 then retry_ms = 1 end
+  return {0, "circuit_open", retry_ms, 0, 0, tostring(streak or 0)}
+end
+
+local function circuit_reopen_after_failed_probe(sh)
+  local threshold = tonumber(redis.call("HGET", cb_policy_key,
+    "failure_threshold") or "0") or 0
+  local cooldown = tonumber(redis.call("HGET", cb_policy_key,
+    "cooldown_ms") or "0") or 0
+  local next_gen = tonumber(sh.gen or "0") + 1
+  local until_ms = now_ms + cooldown
+  redis.call("HSET", cb_state_key,
+    "state", "open", "gen", tostring(next_gen),
+    "failures", tostring(threshold), "probe", "0", "probe_id", "",
+    "opened_at_ms", now_ms, "open_until_ms", until_ms,
+    "last_failure_at_ms", now_ms)
+  redis.call("PEXPIRE", cb_state_key, cooldown + 86400000)
+  return circuit_open_response(cooldown, threshold)
+end
+
+local function circuit_gate()
+  if cb_state_key == "" then return end
+  local enabled = redis.call("HGET", cb_policy_key, "enabled")
+  if enabled ~= "1" then return end
+  cb_admit_owner = cb_owner
+  local state = redis.call("HGETALL", cb_state_key)
+  local sh = {}
+  for i = 1, #state, 2 do sh[state[i]] = state[i + 1] end
+  local status = sh.state or "closed"
+  cb_gen = sh.gen or "0"
+  if status == "open" then
+    local until_ms = tonumber(sh.open_until_ms or "0") or 0
+    if now_ms < until_ms then
+      return circuit_open_response(until_ms - now_ms, sh.failures or 0)
+    end
+    -- 冷静时间到：从 open 原子转 half_open，并只放这一笔。后来的并发请求
+    -- 看到的已经是 half_open，会被挡住；同一时刻不会有两笔试探。
+    redis.call("HSET", cb_state_key,
+      "state", "half_open", "probe", "1",
+      "probe_id", res_key,
+      "half_opened_at_ms", now_ms,
+      "probe_deadline_ms", now_ms + lease_seconds * 1000)
+    redis.call("HSET", cb_callers_key, cb_ch, client)
+    status = "half_open"
+    cb_probe = true
+  elseif status == "half_open" then
+    if sh.probe == "1" then
+      local deadline = tonumber(sh.probe_deadline_ms or "0") or 0
+      if deadline > 0 and now_ms >= deadline then
+        -- 上一笔试探占住后没在约定时限内有回音（通常数据面崩了）：立刻再断，
+        -- 冷静重新算；这个请求不是新试探，直接拒绝。
+        return circuit_reopen_after_failed_probe(sh)
+      end
+      local until_ms = tonumber(sh.open_until_ms or "0") or 0
+      local retry_ms = until_ms > now_ms and (until_ms - now_ms) or 1
+      return circuit_open_response(retry_ms, sh.failures or 0)
+    end
+    -- 试探单已在占额后因池满等系统原因取消：允许下一笔成为唯一试探。
+    redis.call("HSET", cb_state_key, "probe", "1",
+      "probe_id", res_key,
+      "half_opened_at_ms", now_ms,
+      "probe_deadline_ms", now_ms + lease_seconds * 1000)
+    cb_probe = true
+  end
+end
+
+local cb_gate_result = circuit_gate()
+if cb_gate_result then return cb_gate_result end
+
 -- 主备顶上：主钥因突发/窗口占不住的，先记一笔“连着占不住”（顶上判定由
 -- 数据面在本脚本之外编排：先试主钥、占不住再试备钥，绝不同时咬住两头）。
 -- 只有主钥路径记 streak；备钥自己满了不再累加。幂等重放不碰统计。
+local function circuit_cancel_admitted_probe()
+  if cb_probe and cb_state_key ~= "" then
+    -- 熔断试探位已放出，但这笔在密钥自身配额判定上没占住：不能把试探位挂死。
+    -- 回到 open；open_until 已到点时，下一笔可立刻重新成为唯一试探。
+    redis.call("HSET", cb_state_key, "state", "open", "probe", "0",
+               "probe_id", "")
+    cb_probe = false
+  end
+end
+
 local function fb_blocked(reason, retry_ms, rem_b, rem_w)
+  circuit_cancel_admitted_probe()
   if fb_role == "master" and fb_stats_key ~= ""
      and (reason == "burst_limited" or reason == "window_limited") then
     redis.call("HINCRBY", fb_stats_key, "streak", 1)
@@ -546,6 +697,9 @@ redis.call("HSET", res_key,
   "pool_pres", pool_pres,
   "fb_for", fb_role == "backup" and fb_master_kid or "",
   "cred", identity_cred,
+  "cb_owner", cb_admit_owner,
+  "cb_gen", cb_gen,
+  "cb_probe", cb_probe and "1" or "0",
   "outcome", "")
 -- 顶上备钥占成：业务号路由（同一笔永远走第一次占到的那把）与“此刻在顶”
 -- 计数跟备钥占用在同一原子动作里落盘，绝没有“先占主再占备咬住两头”的窗口。

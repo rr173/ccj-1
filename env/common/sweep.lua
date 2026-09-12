@@ -32,6 +32,52 @@ local function zremove_all(zh, zw, rkey, cost_val)
   if zw and zw ~= "" then redis.call("ZREM", zw, unpack(mm)) end
 end
 
+-- 约定时限过了没回音等同于一次真实调用没调成。试探单超时会立刻重新断开；
+-- 普通单只在它那一代仍为 closed 时累加连续失败。
+local function apply_circuit_timeout(owner, caller, res_gen, is_probe, res_id)
+  if not owner or owner == "" or not caller or caller == "" then return end
+  local ch = redis.sha1hex(caller)
+  local policy_key = "{qk:" .. owner .. "}cbcfg"
+  local state_key = "{qk:" .. owner .. "}cb:" .. ch
+  local callers_key = "{qk:" .. owner .. "}cbci"
+  if redis.call("HGET", policy_key, "enabled") ~= "1" then return end
+  local threshold = tonumber(redis.call("HGET", policy_key, "failure_threshold") or "0") or 0
+  local cooldown = tonumber(redis.call("HGET", policy_key, "cooldown_ms") or "0") or 0
+  if threshold <= 0 or cooldown <= 0 then return end
+  local flat = redis.call("HGETALL", state_key)
+  local st = {}
+  for i = 1, #flat, 2 do st[flat[i]] = flat[i + 1] end
+  local gen = st.gen or "0"
+  redis.call("HSET", callers_key, ch, caller)
+
+  local function reopen(next_gen)
+    local until_ms = now_ms + cooldown
+    redis.call("HSET", state_key,
+      "state", "open", "gen", tostring(next_gen),
+      "failures", tostring(threshold), "probe", "0", "probe_id", "",
+      "opened_at_ms", now_ms, "open_until_ms", until_ms,
+      "last_failure_at_ms", now_ms)
+    redis.call("PEXPIRE", state_key, cooldown + 86400000)
+  end
+
+  if is_probe then
+    if st.state == "half_open" and gen == tostring(res_gen or gen)
+       and (not res_id or res_id == "" or st.probe_id == res_id) then
+      reopen(tonumber(gen or "0") + 1)
+    end
+    return
+  end
+  if st.state ~= "closed" or gen ~= tostring(res_gen or gen) then return end
+  local failures = tonumber(st.failures or "0") + 1
+  if failures >= threshold then
+    reopen(tonumber(gen or "0") + 1)
+  else
+    redis.call("HSET", state_key, "failures", tostring(failures),
+               "last_failure_at_ms", now_ms)
+    redis.call("PEXPIRE", state_key, 86400000)
+  end
+end
+
 local function append_timeout(kid, rkey, caller, idem, reserve_at, cost_val, pool_pid, cred)
   if not kid or kid == "" then return end
   local ledger_key = "{qk:" .. kid .. "}ledger"
@@ -83,11 +129,14 @@ for _, m in ipairs(expired_members) do
           local kr = f[10] or ""
           if kr ~= "" and redis.call("EXISTS", kr) == 1 then
             local kf = redis.call("HMGET", kr, "outcome", "lease_exp_ms", "cost",
-                                  "holds", "wholds")
+                                  "holds", "wholds", "caller", "cb_owner",
+                                  "cb_gen", "cb_probe")
             if kf[1] == "" and (tonumber(kf[2] or "0") or 0) <= now_ms then
               local kcost = tonumber(kf[3] or "1") or 1
               zremove_all(kf[4], kf[5], kr, kcost)
               redis.call("HSET", kr, "outcome", "expired")
+              apply_circuit_timeout(kf[7] or f[6], f[7] or kf[6],
+                                    kf[8] or "0", kf[9] == "1", kr)
               paired_timeout = true
             end
           end
@@ -104,7 +153,7 @@ for _, m in ipairs(expired_members) do
         local f = redis.call("HMGET", rkey, "outcome", "lease_exp_ms", "cost",
                              "holds", "wholds", "caller", "idem", "pool",
                              "reserved_at_ms", "kid", "pool_pid", "pool_pres",
-                             "fb_for", "cred")
+                             "fb_for", "cred", "cb_owner", "cb_gen", "cb_probe")
         if f[1] == "" and (tonumber(f[2] or "0") or 0) <= now_ms and f[10] then
           local cost_val = tonumber(f[3] or "1") or 1
           local ppid, ppr = f[11] or "", f[12] or ""
@@ -122,6 +171,8 @@ for _, m in ipairs(expired_members) do
           end
           zremove_all(f[4], f[5], rkey, cost_val)
           redis.call("HSET", rkey, "outcome", "expired")
+          apply_circuit_timeout(f[15] or f[10], f[6] or "", f[16] or "0",
+                                f[17] == "1", rkey)
           local eid = redis.call("XADD", "{qk:" .. f[10] .. "}ledger", "*",
             "kind", "release", "kid", f[10],
             "res", rkey,

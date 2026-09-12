@@ -3,8 +3,10 @@
 --   * confirm（调成了）：占用转为真用掉——此刻才扣令牌桶、才进窗口计数，
 --     占用登记从 ZSET 移除；密钥已停用则拒绝确认（409），占用保持原状，
 --     等释放或过了约定时限自动退回。
---   * release（没调成 / 过了约定回音时限还没回音）：占用登记作废，
---     没真扣过任何计数，额度立刻能被别人再占。
+--   * release（真实调用没调成 / 过了约定回音时限还没回音）：占用登记作废，
+--     没真扣过任何计数，额度立刻能被别人再占，同时给该调用方记一笔连续失败。
+--   * cancel（占住后系统侧没进上游，例如池满/池停）：占用登记作废，但既不算
+--     调成也不算没调成；若取消的是唯一试探，立刻把试探位让回 open，不重算冷静。
 --
 -- 占用单（{qk:<kid>}res:*）由 reserve.lua 写入，本脚本只认单子里的记录，
 -- 不信任调用方传来的池/数量，因此结的一定是当初占的那一份、那个池。
@@ -17,7 +19,7 @@
 -- KEYS[3] = ledger  占用流水 Stream（只 XADD，永不修改）
 --
 -- ARGV:
---  1  action      "confirm" / "release"
+--  1  action      "confirm" / "release" / "cancel"
 --  2  force       "1" 表示无视约定回音时限立即释放（没调成时的即时退款）；
 --                 "0" 表示仅在已过期（lease_exp_ms <= now）时允许释放
 --                 （占用方失联，由别人来把占着的额度退回公共池）
@@ -25,12 +27,16 @@
 -- 占用单 outcome 状态机：
 --   ""（还占着）
 --     ├─ confirm（未停用）        → confirmed，记一笔 confirm
---     └─ release force / 过期     → released，记一笔 release(reason=upstream)
+--     ├─ release force / 过期     → released，记一笔 release(reason=upstream)，
+--     │                             并推进按调用方熔断
+--     └─ cancel                  → released，记 release(reason=cancelled)，
+--                                  不算上游失败；试探单只释放试探位
 --   "expired"（约定时限过了没回音，reserve.lua/sweep.lua 已按超时退回，
---              并留过一笔 release(reason=timeout)）
+--              熔断也已在超时时记账，并留过一笔 release(reason=timeout)）
 --     ├─ confirm（未停用）        → confirmed，记一笔 confirm 且 late=1
---                                   （迟到的真实调用仍记账，不丢真实调用）
---     └─ release                 → released，不再留第二笔退回流水
+--                                   （迟到的真实调用仍记账，不丢真实调用；
+--                                    不解除它之后才发生的新一轮熔断）
+--     └─ release/cancel          → released，不再留第二笔退回流水
 --   "confirmed" / "released"      → 终态，任何再了结只回原结论
 --
 -- 返回：
@@ -47,7 +53,7 @@ local ledger_key = KEYS[3]
 local action = ARGV[1]
 local force  = ARGV[2] == "1"
 
-if action ~= "confirm" and action ~= "release" then
+if action ~= "confirm" and action ~= "release" and action ~= "cancel" then
   return {0, "bad_action"}
 end
 
@@ -79,6 +85,9 @@ local wholds_key   = h.wholds
 local pool_pid     = h.pool_pid or ""
 local pool_pres    = h.pool_pres or ""
 local fb_for       = h.fb_for or ""  -- 非空表示这张单子是顶上备钥替该主钥占的
+local cb_owner     = h.cb_owner or ""
+local cb_gen       = h.cb_gen or "0"
+local cb_probe     = h.cb_probe == "1"
 local pcfg_key     = pool_pid ~= "" and ("{qp:" .. pool_pid .. "}cfg") or ""
 local SCALE        = 1000
 
@@ -155,6 +164,106 @@ local function ledger_mirror_primary(kind, reason, late)
   end
 end
 
+-- 按调用方熔断：只有真正走到上游的失败才累加；池停/池满导致没进上游用
+-- cancel，不改连续失败。试探单成功只在它仍是当前 half_open 代际时解开。
+local function circuit_success()
+  if cb_owner == "" or h.caller == "" then return end
+  local policy_key = "{qk:" .. cb_owner .. "}cbcfg"
+  if redis.call("HGET", policy_key, "enabled") ~= "1" then return end
+  if h.outcome == "expired" and not cb_probe then
+    -- 已按“说好的时间没回音”记过超时失败；迟到成功只补真实调用账，
+    -- 不能再把超时之后的新连续失败清掉。
+    return
+  end
+  local ch = redis.sha1hex(h.caller)
+  local state_key = "{qk:" .. cb_owner .. "}cb:" .. ch
+  if redis.call("EXISTS", state_key) == 0 then return end
+  local flat = redis.call("HGETALL", state_key)
+  local st = {}
+  for i = 1, #flat, 2 do st[flat[i]] = flat[i + 1] end
+  local gen = st.gen or "0"
+  redis.call("HSET", "{qk:" .. cb_owner .. "}cbci", ch, h.caller)
+  if cb_probe then
+    if st.state == "half_open" and gen == cb_gen and st.probe_id == res_key then
+      redis.call("HSET", state_key, "state", "closed", "failures", "0",
+                 "probe", "0", "probe_id", "",
+                 "last_success_at_ms", now_ms,
+                 "opened_at_ms", "0", "open_until_ms", "0")
+      redis.call("PEXPIRE", state_key, 86400000)
+    end
+    return
+  end
+  -- 断着期间早先占住的调用也按原单结完；只要它调成了，就清连续没成。
+  -- 但不绕过冷静期/唯一试探规则，只有当前试探成了才改状态。
+  if gen == cb_gen and (st.state == "closed" or st.state == "open"
+     or st.state == "half_open") then
+    redis.call("HSET", state_key, "failures", "0",
+               "last_success_at_ms", now_ms)
+  end
+end
+
+local function circuit_failure()
+  if cb_owner == "" or h.caller == "" then return end
+  local policy_key = "{qk:" .. cb_owner .. "}cbcfg"
+  if redis.call("HGET", policy_key, "enabled") ~= "1" then return end
+  local ch = redis.sha1hex(h.caller)
+  local state_key = "{qk:" .. cb_owner .. "}cb:" .. ch
+  local callers_key = "{qk:" .. cb_owner .. "}cbci"
+  local threshold = tonumber(redis.call("HGET", policy_key, "failure_threshold") or "0") or 0
+  local cooldown = tonumber(redis.call("HGET", policy_key, "cooldown_ms") or "0") or 0
+  if threshold <= 0 or cooldown <= 0 then return end
+  local flat = redis.call("HGETALL", state_key)
+  local st = {}
+  for i = 1, #flat, 2 do st[flat[i]] = flat[i + 1] end
+  local gen = st.gen or "0"
+  redis.call("HSET", callers_key, ch, h.caller)
+
+  local function reopen(next_gen)
+    local until_ms = now_ms + cooldown
+    redis.call("HSET", state_key,
+      "state", "open", "gen", tostring(next_gen),
+      "failures", tostring(threshold), "probe", "0", "probe_id", "",
+      "opened_at_ms", now_ms, "open_until_ms", until_ms,
+      "last_failure_at_ms", now_ms)
+    redis.call("PEXPIRE", state_key, cooldown + 86400000)
+  end
+
+  if cb_probe then
+    if st.state == "half_open" and gen == cb_gen and st.probe_id == res_key then
+      reopen(tonumber(gen or "0") + 1)
+    end
+    return
+  end
+
+  if st.state ~= "closed" or gen ~= cb_gen then return end
+  local failures = tonumber(st.failures or "0") + 1
+  if failures >= threshold then
+    reopen(tonumber(gen or "0") + 1)
+  else
+    redis.call("HSET", state_key, "failures", tostring(failures),
+               "last_failure_at_ms", now_ms)
+    redis.call("PEXPIRE", state_key, 86400000)
+  end
+end
+
+local function circuit_cancel()
+  if cb_owner == "" or h.caller == "" or not cb_probe then return end
+  local policy_key = "{qk:" .. cb_owner .. "}cbcfg"
+  if redis.call("HGET", policy_key, "enabled") ~= "1" then return end
+  local ch = redis.sha1hex(h.caller)
+  local state_key = "{qk:" .. cb_owner .. "}cb:" .. ch
+  local flat = redis.call("HGETALL", state_key)
+  local st = {}
+  for i = 1, #flat, 2 do st[flat[i]] = flat[i + 1] end
+  if st.state == "half_open" and (st.gen or "0") == cb_gen
+     and st.probe_id == res_key then
+    -- 这笔没进上游，不算试探失败：回到 open，不重算冷静；若冷静已到点，
+    -- 下一笔请求可立即成为新的唯一试探。
+    redis.call("HSET", state_key, "state", "open", "probe", "0",
+               "probe_id", "")
+  end
+end
+
 -- 读写池侧配对单。池侧没有独立流水；它只负责聚合配额，事实流水仍写在密钥账本。
 local function pool_pair()
   if pool_pid == "" or pool_pres == "" or redis.call("EXISTS", pool_pres) == 0 then
@@ -219,7 +328,7 @@ end
 -- 拦截（超时退回时已留过 release 流水，不能再留第二笔）。expired 单子收到
 -- confirm 不拦截——迟到的真实应答还要推进成 confirmed 并补记 confirm。
 if h.outcome == "confirmed" or h.outcome == "released"
-   or (h.outcome == "expired" and action == "release") then
+   or (h.outcome == "expired" and action ~= "confirm") then
   local shown = h.outcome
   if shown == "expired" then shown = "released" end
   return {1, shown, tonumber(h.lease_exp or 0)}
@@ -255,6 +364,7 @@ if action == "confirm" then
       if fb_for ~= "" then
         redis.call("HINCRBY", "{qk:" .. fb_for .. "}fbsv", "active", -1)
       end
+      circuit_cancel()
       ledger_add("release", "pool_stopped", false)
       ledger_mirror_primary("release", "pool_stopped", false)
       return {0, "pool_stopped"}
@@ -327,6 +437,7 @@ if action == "confirm" then
   end
 
   redis.call("HSET", res_key, "outcome", "confirmed")
+  circuit_success()
   -- 密钥换新：按“这笔调用实际出示的明文”累计真用掉。新旧明文共用逻辑 kid
   -- 名下同一份突发/窗口（上面扣的就是那一份），这里只做按明文的归因计数，
   -- 不新增、不复制任何额度；冲正（reverse.lua）会从同一计数减回净额。
@@ -356,9 +467,12 @@ if action == "confirm" then
   return {1, "confirmed", tonumber(h.lease_exp or 0)}
 end
 
+-- cancel：占住后系统侧决定不进上游，无视回音时限立即释放，但不算失败
+local is_cancel = action == "cancel"
+
 -- release：未过期且非强制 → 占用方还有约定时间回音，不能抢
 local lease_exp_ms = tonumber(h.lease_exp_ms or "0")
-if not force and lease_exp_ms > now_ms then
+if not is_cancel and not force and lease_exp_ms > now_ms then
   local wait_ms = lease_exp_ms - now_ms
   if wait_ms < 1 then wait_ms = 1 end
   return {0, "not_expired", wait_ms}
@@ -384,8 +498,14 @@ redis.call("HSET", res_key, "outcome", "released")
 if fb_for ~= "" then
   redis.call("HINCRBY", "{qk:" .. fb_for .. "}fbsv", "active", -1)
 end
+local release_reason = is_cancel and "cancelled" or "upstream"
+if is_cancel then
+  circuit_cancel()
+else
+  circuit_failure()
+end
 -- 上游 5xx / 连不上 / 调用方断连的即时退回（force=1），或按过期显式释放，
--- 留一笔 release(reason=upstream) 流水。同一业务号再来只回原结论，不留第二笔。
-ledger_add("release", "upstream", false)
-ledger_mirror_primary("release", "upstream", false)
+-- 留一笔 release；cancel 是没进上游的系统侧取消，reason=cancelled。
+ledger_add("release", release_reason, false)
+ledger_mirror_primary("release", release_reason, false)
 return {1, "released", tonumber(h.lease_exp or 0)}

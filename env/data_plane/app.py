@@ -182,7 +182,8 @@ async def reserve_one(effective_kid: str, idem: str, client: str, res_key: str,
                       fb_role: str = "", fb_master_kid: str = "",
                       fb_route_key: str = "", fb_stats_key: str = "",
                       presented_cred: str = "",
-                      identity_cred: str = "") -> list:
+                      identity_cred: str = "",
+                      cb_owner: str = "") -> list:
     """在一把指定的密钥上完成“密钥自身 + 可选共享池”的占用。
 
     对调用方来说进来的永远是主钥（X-Api-Key），但主备顶上时真正占到的
@@ -225,6 +226,7 @@ async def reserve_one(effective_kid: str, idem: str, client: str, res_key: str,
         fb_stats_key,
         presented_cred,
         identity_cred,
+        fb_master_kid if fb_role == "backup" else kid,
     ]
     num_keys = 7 if fb_route_key else 6
     lua_keys = [keys.cfg_key(effective_kid), keys.tb_key(effective_kid),
@@ -262,8 +264,9 @@ async def reserve_one(effective_kid: str, idem: str, client: str, res_key: str,
             aioredis.BusyLoadingError) as exc:
         raise StoreUnavailableError() from exc
     if not pcfg:
-        # 归属指向了不存在/已删除的池：保守拒绝新占并释放刚占的密钥侧。
-        await settle(effective_kid, res_key, "release", force=True)
+        # 池侧没占住：密钥侧这笔根本没进上游，不算上游失败；若是唯一试探，
+        # settle.lua 只把试探位让回 open，不重新计算冷静时间。
+        await settle(effective_kid, res_key, "cancel", force=True)
         return [0, "pool_stopped", 0, 0, 0]
 
     pool_keys = [
@@ -295,10 +298,10 @@ async def reserve_one(effective_kid: str, idem: str, client: str, res_key: str,
         return [2, key_result[1], "", pool_result[3], pool_result[4], pool_res_key]
     if pc == 0 and pool_result[1] in {"burst_limited", "window_limited"}:
         # 密钥自己还有但池满：立即释放刚占的密钥侧；响应只报池还需等多久。
-        await settle(effective_kid, res_key, "release", force=True)
+        await settle(effective_kid, res_key, "cancel", force=True)
         return pool_result
     if pc == 0 and pool_result[1] == "pool_stopped":
-        await settle(effective_kid, res_key, "release", force=True)
+        await settle(effective_kid, res_key, "cancel", force=True)
         return pool_result
     if pc == 3 and pool_result[1] == "not pool member":
         # 并发移出池：这次请求不再受池限制，沿用密钥侧已占住的额度。
@@ -336,7 +339,8 @@ async def reserve_with_failover(kid: str, idem: str, client: str,
             route_res_key = keys.reservation_key(routed, idem)
             return routed, route_res_key, await reserve_one(
                 routed, idem, client, route_res_key,
-                presented_cred="", identity_cred=cred)
+                presented_cred="", identity_cred=cred,
+                fb_role="backup", fb_master_kid=kid)
 
     # 2) 先只占主钥。没绑备钥时 fb_role 为空，行为与旧版完全一致。
     try:
@@ -539,6 +543,11 @@ async def handle_proxy(request: web.Request) -> web.Response:
         if reason == "pool_stopped":
             return _error(403, "pool_stopped",
                           detail="quota pool is stopped; it cannot accept new reservations")
+        if reason == "circuit_open":
+            return _error(503, "caller_circuit_open",
+                          retry_after_ms=int(retry_ms),
+                          detail=f"caller '{client}' is circuit-open on this API key; "
+                                 "one probe request will be admitted after the cooldown")
         # 备钥也满了：等待时间以备钥这次判定为准（“备钥也满了才告诉还要等多久”）
         return _error(429, reason, retry_after_ms=int(retry_ms),
                       remaining_burst=int(rem_burst),

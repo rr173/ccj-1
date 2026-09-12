@@ -38,6 +38,7 @@ _FAILOVER_MEMBER_SRC = (COMMON_DIR / "failover_member.lua").read_text(encoding="
 _ROTATE_SRC = (COMMON_DIR / "rotate.lua").read_text(encoding="utf-8")
 _ROTATE_RETIRE_SRC = (COMMON_DIR / "rotate_retire.lua").read_text(encoding="utf-8")
 _TRANSFER_SRC = (COMMON_DIR / "transfer.lua").read_text(encoding="utf-8")
+_CIRCUIT_BREAKER_SRC = (COMMON_DIR / "circuit_breaker.lua").read_text(encoding="utf-8")
 # SHA 放在可变 dict 里：Redis 重启清空脚本缓存后由 script_runner 刷新，
 # 无需重启本进程
 _quota_sha: dict = {"sha": None}
@@ -49,6 +50,7 @@ _failover_member_sha: dict = {"sha": None}
 _rotate_sha: dict = {"sha": None}
 _rotate_retire_sha: dict = {"sha": None}
 _transfer_sha: dict = {"sha": None}
+_circuit_breaker_sha: dict = {"sha": None}
 
 
 def quota_eval(cfg_key_: str, tb_key_: str, shares_key_: str, *argv) -> tuple:
@@ -126,6 +128,15 @@ def transfer_eval(source_kid: str, target_kid: str, transfer_id: str,
          burst_amount, window_amount])
 
 
+def circuit_breaker_eval(kid: str, action: str, *args, caller: str = "") -> list:
+    caller_arg = caller
+    state_key = keys.circuit_state_key(kid, caller) if caller else keys.cfg_key(kid)
+    return run_script_sync(
+        r, _CIRCUIT_BREAKER_SRC, _circuit_breaker_sha, 3,
+        [keys.cfg_key(kid), keys.circuit_policy_key(kid), state_key,
+         action, keys.caller_hash(caller_arg), caller_arg, *args])
+
+
 app = FastAPI(title="quota-control-plane", version="1.0.0")
 
 
@@ -174,6 +185,15 @@ class ShareRequest(BaseModel):
     补充速率与窗口长度沿用密钥配置（份额只是总量里的一截）。"""
     burst_capacity: int = Field(gt=0, description="该调用方预留的突发容量")
     window_quota: int = Field(gt=0, description="该调用方预留的窗口总量")
+
+
+class CircuitBreakerRequest(BaseModel):
+    """整把密钥一套按调用方熔断阈值。"""
+    failure_threshold: int = Field(
+        ge=1, le=10000, description="连续多少次真实调用没调成/超时没回音后断开")
+    cooldown_seconds: int = Field(
+        ge=1, le=30 * 86400, description="断开后的冷静时间（秒）；到点只放一笔试探")
+    enabled: bool = Field(default=True, description="是否启用；停用配置不删运行状态")
 
 
 class ReverseRequest(BaseModel):
@@ -1231,6 +1251,164 @@ def reverse_consumption(kid: str, body: ReverseRequest) -> dict:
             "requested_amount": body.amount,
         })
     raise HTTPException(status_code=400, detail=str(reason))
+
+
+def _circuit_policy_view(kid: str) -> dict | None:
+    p = r.hgetall(keys.circuit_policy_key(kid))
+    if not p:
+        return None
+    return {
+        "enabled": p.get(keys.F_CB_ENABLED, "0") == "1",
+        "failure_threshold": int(p.get(keys.F_CB_FAILURE_THRESHOLD, "0") or 0),
+        "cooldown_ms": int(p.get(keys.F_CB_COOLDOWN_MS, "0") or 0),
+        "cooldown_seconds": round(
+            int(p.get(keys.F_CB_COOLDOWN_MS, "0") or 0) / 1000, 3),
+    }
+
+
+def _circuit_state_view(kid: str, caller_hash: str, caller: str,
+                        policy: dict | None, now_ms: int) -> dict:
+    st = r.hgetall(keys.circuit_state_key(kid, caller))
+    cooldown_ms = int(policy["cooldown_ms"]) if policy else 0
+    threshold = int(policy["failure_threshold"]) if policy else 0
+    stored_state = st.get("state", "closed")
+    failures = int(st.get("failures", "0") or 0)
+    probe = st.get("probe", "0") == "1"
+    open_until = int(st.get("open_until_ms", "0") or 0)
+    state = stored_state
+    remaining_ms = 0
+
+    if stored_state == "open":
+        if open_until > now_ms:
+            remaining_ms = open_until - now_ms
+        elif policy and policy["enabled"]:
+            # 存储里仍为 open，只表示还没人来触发试探；此刻到点后下一笔会被放行。
+            state = "half_open_ready"
+    elif stored_state == "half_open":
+        state = "probe_in_flight" if probe else "half_open_ready"
+
+    return {
+        "caller": caller,
+        "caller_id": caller_hash,
+        "state": state,
+        "stored_state": stored_state,
+        "open": (
+            stored_state == "open" and open_until > now_ms and policy is not None
+            and policy["enabled"]
+        ),
+        "consecutive_failures": failures,
+        "failure_threshold": threshold,
+        "cooldown_remaining_ms": remaining_ms,
+        "open_until_ms": open_until if remaining_ms > 0 else None,
+        "probe_in_flight": stored_state == "half_open" and probe,
+        "generation": int(st.get("gen", "0") or 0),
+        "opened_at_ms": int(st.get("opened_at_ms", "0") or 0) or None,
+        "last_failure_at_ms": int(st.get("last_failure_at_ms", "0") or 0) or None,
+        "last_success_at_ms": int(st.get("last_success_at_ms", "0") or 0) or None,
+        "manually_reset_at_ms": int(
+            st.get("manually_reset_at_ms", "0") or 0) or None,
+    }
+
+
+@app.put("/v1/keys/{kid}/circuit-breaker", dependencies=[Depends(require_admin)])
+def configure_circuit_breaker(kid: str, body: CircuitBreakerRequest) -> dict:
+    """给一把有效密钥配置按调用方熔断：连续失败次数与冷静时间。"""
+    if _load_config(kid) is None:
+        raise HTTPException(status_code=404, detail="key not found")
+    try:
+        res = circuit_breaker_eval(
+            kid, "configure",
+            body.failure_threshold, body.cooldown_seconds * 1000,
+            "1" if body.enabled else "0")
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    if int(res[0]) != 1:
+        reason = res[1]
+        if reason == "key not found":
+            raise HTTPException(status_code=404, detail="key not found")
+        if reason == "revoked":
+            raise HTTPException(status_code=409, detail={
+                "code": "key_revoked",
+                "message": "circuit breakers can be configured only on active keys",
+            })
+        raise HTTPException(status_code=400, detail=str(reason))
+    return {
+        "key_id": kid,
+        "circuit_breaker": {
+            "enabled": res[3] == "1",
+            "failure_threshold": int(res[1]),
+            "cooldown_ms": int(res[2]),
+            "cooldown_seconds": int(res[2]) / 1000,
+        },
+    }
+
+
+@app.get("/v1/keys/{kid}/circuit-breaker", dependencies=[Depends(require_admin)])
+def get_circuit_breaker(kid: str) -> dict:
+    """查一把密钥现在各调用方的熔断状态。密钥停用后状态仍可查。"""
+    cfg = _load_config(kid)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="key not found")
+    try:
+        t_sec, t_usec = r.time()
+        now_ms = t_sec * 1000 + t_usec // 1000
+        policy = _circuit_policy_view(kid)
+        rows = []
+        for ch in r.hkeys(keys.circuit_callers_key(kid)):
+            caller = r.hget(keys.circuit_callers_key(kid), ch) or ch
+            if not r.exists(keys.circuit_state_key(kid, caller)):
+                continue
+            rows.append(_circuit_state_view(kid, ch, caller, policy, now_ms))
+        rows.sort(key=lambda x: (not x["open"], -x["consecutive_failures"],
+                                  x["caller"]))
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    return {
+        "key_id": kid,
+        "state": "revoked" if cfg.get(keys.F_REVOKED) == "1" else "active",
+        "policy": policy or {
+            "enabled": False, "failure_threshold": None,
+            "cooldown_ms": None, "cooldown_seconds": None,
+        },
+        "caller_count": len(rows),
+        "open_count": sum(1 for row in rows if row["open"]),
+        "callers": rows,
+    }
+
+
+@app.post("/v1/keys/{kid}/circuit-breaker/{caller}/reset",
+          dependencies=[Depends(require_admin)])
+def reset_circuit_breaker(kid: str, caller: str) -> dict:
+    """提前手动解开某调用方的熔断；清连续失败并生成新一代，旧试探立即失效。"""
+    if _load_config(kid) is None:
+        raise HTTPException(status_code=404, detail="key not found")
+    caller_hash = keys.caller_hash(caller)
+    try:
+        res = circuit_breaker_eval(kid, "reset", caller=caller)
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    if int(res[0]) not in (1, 2):
+        reason = res[1]
+        if reason == "key not found":
+            raise HTTPException(status_code=404, detail="key not found")
+        if reason == "revoked":
+            raise HTTPException(status_code=409, detail={
+                "code": "key_revoked",
+                "message": "circuit breakers on a revoked key cannot be reset",
+            })
+        raise HTTPException(status_code=400, detail=str(reason))
+    return {
+        "key_id": kid,
+        "caller": caller,
+        "caller_id": caller_hash,
+        "reset": True,
+        "created_state": int(res[0]) == 2,
+        "generation": int(res[2]),
+        "reset_at_ms": int(res[3]),
+    }
 
 
 @app.put("/v1/keys/{kid}/shares/{caller}", dependencies=[Depends(require_admin)])

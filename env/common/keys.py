@@ -21,6 +21,10 @@ F_CREATED_AT = "created_at"
 F_RESERVED_BURST = "reserved_burst"
 F_RESERVED_WINDOW = "reserved_window"
 F_STOPPED = "stopped"
+# 按调用方熔断：整把密钥一套阈值，逐调用方维护状态。
+F_CB_FAILURE_THRESHOLD = "failure_threshold"
+F_CB_COOLDOWN_MS = "cooldown_ms"
+F_CB_ENABLED = "enabled"
 
 # ── 密钥换新（明文轮换，配额身份不变）──────────────────────────────────────
 # 换的是“调用明文”，不是密钥本体：kid = sha256(签发时那把明文) 永远是这把密钥
@@ -113,6 +117,24 @@ def share_tb_key(kid: str, caller: str) -> str:
 def share_win_key(kid: str, caller: str, window_seconds: int, bucket_index: int) -> str:
     """点名调用方自己的窗口计数桶（与公共池 {qk:<kid>}win:* 完全隔离）。"""
     return f"{{qk:{kid}}}swin:{caller_hash(caller)}:{window_seconds}:{bucket_index}"
+
+
+# ── 按调用方熔断 ───────────────────────────────────────────────────────────
+# 阈值是密钥级配置；状态按 (密钥, 调用方) 拆 hash。状态不设 TTL：重启和密钥
+# 停用后仍可查询；只在手动解开 / 试跳成功 / 旧调用调成清零时改变。
+def circuit_policy_key(kid: str) -> str:
+    """密钥级熔断阈值配置 hash。"""
+    return f"{{qk:{kid}}}cbcfg"
+
+
+def circuit_state_key(kid: str, caller: str) -> str:
+    """某调用方在这把密钥上的熔断状态 hash。"""
+    return f"{{qk:{kid}}}cb:{caller_hash(caller)}"
+
+
+def circuit_callers_key(kid: str) -> str:
+    """熔断状态调用方索引：field=sha1(caller)，value=最近一次调用方原文。"""
+    return f"{{qk:{kid}}}cbci"
 
 
 # ── 占用流水（只追加账本）──────────────────────────────────────────────────

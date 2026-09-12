@@ -35,6 +35,7 @@
 | 多把有效密钥共用一个跨密钥额度池 | `POST /v1/pools` 开池并写明突发/窗口上限；`PUT/DELETE /v1/pools/{pid}/keys/{kid}` 放入/拿出密钥。数据面每次占用必须同时占住“密钥自己的额度”和“池聚合额度”；任一边占不住即拒绝并给 Retry-After。`GET /v1/pools/{pid}` 查池剩余/在池密钥/还占着/真用掉，密钥余量接口也带 `quota_pool` |
 | 密钥换新（换调用明文，不换配额身份） | `POST /v1/keys/{kid}/rotate` 给**还有效**的密钥换新明文，并写明旧明文宽限多久（`grace_seconds`）。宽限期内新旧两把都能占，吃的是这把密钥**同一份**突发/窗口（真用掉不清零、桶不重填）；宽限过点或 `POST /v1/keys/{kid}/rotate/retire` 提前收掉后旧明文不能再占**新的**；用旧明文开了头还没结的在飞单照样结完。`GET /v1/keys/{kid}/quota` 的 `rotation` 节列出此刻哪些明文还能用、旧的还剩多久、新旧各自真用掉多少。同一业务号跨新旧明文命中同一占用单，不二次占；上一档宽限没到不能再换 |
 | 两把有效密钥间划转当前可再占额度 | `POST /v1/keys/{kid}/transfers` 写明目标密钥、划转号、突发/窗口各划多少；`transfer.lua` 原子保证两边同时做成。只能划源密钥此刻“未真用、未在占”的余量，不能超过目标密钥原配额下的空位；任一头停用、源不足、目标空位不足都整笔拒绝。旧占用单不碰，仍按原池结完。同一划转号原参数重放回原结论、不二次划转，参数不同返回冲突；`GET /v1/keys/{kid}/transfers` 查划出/划入累计和每笔明细，`GET /v1/transfers/{id}` 按号查 |
+| 按调用方熔断 | `PUT /v1/keys/{kid}/circuit-breaker` 给有效密钥配置连续失败次数和冷静秒数；状态按 `(密钥, X-Client-Id)` 分开。真实调用 5xx/连不上/调用方断连，或过了约定回音时限没回音，记一笔连续没成；次数到了只断这个人，返回 503 `caller_circuit_open` 和还要等多久，其他调用方照常占。断着期间已占住的旧调用继续结；调成清零连续失败。冷静到点后 Redis 原子只放一笔试探，试探成了才解开，败了立刻再断且冷静重新算；池满/池停导致没进上游只释放试探位，不算失败。`GET .../circuit-breaker` 查每个调用方的连续失败、剩余冷静、是否正在试；`POST .../circuit-breaker/{caller}/reset` 可提前手动解开。同一业务号始终回第一次结论，熔断不二次占额；密钥停用后不能占新，熔断状态仍可查，AOF 保证重启后仍断 |
 | Docker 部署 | `docker compose up -d --build`，含 Redis（持久化卷）、控制面、数据面、模拟上游 |
 
 ## 架构
@@ -135,7 +136,22 @@ curl -s -X PUT localhost:8000/v1/keys/<kid>/shares/alice \
   -d '{"burst_capacity":2,"window_quota":20}'
 # 之后 alice（X-Client-Id: alice）只占用自己的 2/20；其他调用方只能占
 # 公共池（突发 3、窗口 80）。Σ份额超总量会被 409 拒绝；取消预留：
+# 取消预留：
 #   curl -X DELETE localhost:8000/v1/keys/<kid>/shares/alice ...
+
+# 给这把密钥配置按调用方熔断：连续 3 次真实没调成/超时没回音就断，冷静 30s
+curl -s -X PUT localhost:8000/v1/keys/<kid>/circuit-breaker \
+  -H "Authorization: Bearer change-me-admin-token" \
+  -H 'Content-Type: application/json' \
+  -d '{"failure_threshold":3,"cooldown_seconds":30}'
+
+# 查询哪些调用方正断着、连续失败几次、还要多久、是否正在放唯一试探
+curl -s localhost:8000/v1/keys/<kid>/circuit-breaker \
+  -H "Authorization: Bearer change-me-admin-token"
+
+# 提前手动解开 alice（清连续失败；旧试探立即失效）
+curl -s -X POST localhost:8000/v1/keys/<kid>/circuit-breaker/alice/reset \
+  -H "Authorization: Bearer change-me-admin-token"
 
 # 停用
 curl -s -X POST localhost:8000/v1/keys/<kid>/revoke \
@@ -151,6 +167,7 @@ python3 demo/e2e_demo.py --restart  # 额外重启 Redis 验证 AOF 持久化
 python3 demo/failover_demo.py       # 主备顶上
 python3 demo/rotation_demo.py       # 密钥换新（新旧明文宽限/收掉/停用/幂等）
 python3 demo/transfer_demo.py       # 跨密钥额度划转（原子/余量/在飞/幂等/查询）
+python3 demo/circuit_breaker_demo.py # 按调用方熔断（阈值/冷静/唯一试探/手动解开/幂等）
 ```
 
 ## 限流返回示例
@@ -178,6 +195,8 @@ X-Retry-After-Ms: 400
 或被提前收掉，需改用当前明文）、`quota_store_unavailable`（503，记额度层
 重启/不可用，带 `Retry-After: 2`，Redis 恢复后自动自愈、无需重启两端）、
 `pool_stopped`（403，跨密钥共享池已停，新占用和在飞确认都不算）、
+`caller_circuit_open`（503，这个调用方在这把密钥上熔断；`retry_after_ms`
+是剩余冷静时间，冷静到点后系统只放一笔试探，其他并发请求仍被拒）、
 `upstream_unavailable`（502，这次没调成，**占着的额度已退回**）、
 `idempotent_replay_confirmed` / `idempotent_replay_released` /
 `idempotent_replay_timeout`（409，同一业务号重放：已确认 / 已退回 /
