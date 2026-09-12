@@ -37,6 +37,7 @@ _POOL_MEMBER_SRC = (COMMON_DIR / "pool_member.lua").read_text(encoding="utf-8")
 _FAILOVER_MEMBER_SRC = (COMMON_DIR / "failover_member.lua").read_text(encoding="utf-8")
 _ROTATE_SRC = (COMMON_DIR / "rotate.lua").read_text(encoding="utf-8")
 _ROTATE_RETIRE_SRC = (COMMON_DIR / "rotate_retire.lua").read_text(encoding="utf-8")
+_TRANSFER_SRC = (COMMON_DIR / "transfer.lua").read_text(encoding="utf-8")
 # SHA 放在可变 dict 里：Redis 重启清空脚本缓存后由 script_runner 刷新，
 # 无需重启本进程
 _quota_sha: dict = {"sha": None}
@@ -47,6 +48,7 @@ _pool_member_sha: dict = {"sha": None}
 _failover_member_sha: dict = {"sha": None}
 _rotate_sha: dict = {"sha": None}
 _rotate_retire_sha: dict = {"sha": None}
+_transfer_sha: dict = {"sha": None}
 
 
 def quota_eval(cfg_key_: str, tb_key_: str, shares_key_: str, *argv) -> tuple:
@@ -106,6 +108,22 @@ def rotate_retire_eval(kid: str) -> list:
     return run_script_sync(
         r, _ROTATE_RETIRE_SRC, _rotate_retire_sha, 1,
         [keys.rotation_status_key(kid), kid])
+
+
+def transfer_eval(source_kid: str, target_kid: str, transfer_id: str,
+                  burst_amount: int, window_amount: int) -> list:
+    """两把有效密钥之间原子划转当前可再占的突发/窗口额度。"""
+    return run_script_sync(
+        r, _TRANSFER_SRC, _transfer_sha, 14,
+        [keys.transfer_record_key(transfer_id), keys.transfers_index_key(),
+         keys.cfg_key(source_kid), keys.tb_key(source_kid),
+         keys.holds_key(source_kid), keys.window_holds_key(source_kid),
+         keys.cfg_key(target_kid), keys.tb_key(target_kid),
+         keys.holds_key(target_kid), keys.window_holds_key(target_kid),
+         keys.shares_key(source_kid), keys.shares_key(target_kid),
+         keys.transfer_totals_key(source_kid), keys.transfer_totals_key(target_kid),
+         transfer_id, source_kid, target_kid,
+         burst_amount, window_amount])
 
 
 app = FastAPI(title="quota-control-plane", version="1.0.0")
@@ -182,6 +200,25 @@ class RotateRequest(BaseModel):
         default=keys.DEFAULT_ROTATION_GRACE_SECONDS, gt=0,
         le=keys.MAX_ROTATION_GRACE_SECONDS,
         description="旧明文宽限期（秒）：这段时间新旧明文都能占，吃同一份配额")
+
+
+class TransferRequest(BaseModel):
+    """两把有效密钥之间划转当前还能再占的额度。
+
+    划转不是改配额容量：只能划 source 此刻未真用、未占用的可再占余量；
+    target 只接收其原配额下还空着的位置；同一 transfer_id 重放回原结论。
+    两个维度都可为 0，但至少一个为正。
+    """
+    transfer_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$",
+        description="划转业务号；同一号只能划一次，重复提交按幂等处理")
+    target_key_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$",
+        description="划入方密钥 ID")
+    burst_amount: int = Field(
+        default=0, ge=0, description="划出的突发额度；必须是当前可再占余量内的整数")
+    window_amount: int = Field(
+        default=0, ge=0, description="划出的当前窗口额度；必须是当前可再占余量内的整数")
 
 
 def require_admin(authorization: Optional[str] = Header(default=None)) -> None:
@@ -400,6 +437,210 @@ def retire_previous_plaintext(kid: str) -> dict:
             "message": "key was never rotated; there is no previous plaintext to retire",
         })
     raise HTTPException(status_code=400, detail=str(res[1]))
+
+
+def _transfer_view(transfer_id: str) -> Optional[dict]:
+    """组装一笔划转单；记录不存在返回 None。"""
+    rec = r.hgetall(keys.transfer_record_key(transfer_id))
+    if not rec:
+        return None
+    return {
+        "transfer_id": rec["transfer_id"],
+        "state": rec.get("state", "completed"),
+        "source_key_id": rec["source_key_id"],
+        "target_key_id": rec["target_key_id"],
+        "burst_amount": int(rec.get("burst_amount", "0")),
+        "window_amount": int(rec.get("window_amount", "0")),
+        "created_at_ms": int(rec.get("created_at_ms", "0")),
+    }
+
+
+def _list_transfer_ids(index_key: Optional[str], limit: int, offset: int,
+                       direction: str = "desc") -> list[str]:
+    if index_key is None:
+        index_key = keys.transfers_index_key()
+    if direction == "asc":
+        return r.zrange(index_key, offset, offset + limit - 1)
+    return r.zrevrange(index_key, offset, offset + limit - 1)
+
+
+@app.post("/v1/keys/{kid}/transfers", status_code=201,
+          dependencies=[Depends(require_admin)])
+def create_transfer(kid: str, body: TransferRequest) -> JSONResponse:
+    """从本把密钥向另一把有效密钥原子划转当前可再占额度。
+
+    成功时突发/窗口两边计数在同一段 Lua 中一次改完；源没有那么多、目标没有
+    那么多空位、任一方停用、同号参数冲突等情况下整笔不变。同号原参数重放
+    返回 200 和上一次划转单，不二次划转。
+    """
+    if body.target_key_id == kid:
+        raise HTTPException(status_code=409, detail={
+            "code": "same_key",
+            "message": "source and target key must be different",
+        })
+    try:
+        res = transfer_eval(kid, body.target_key_id, body.transfer_id,
+                            body.burst_amount, body.window_amount)
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+
+    code = int(res[0])
+    if code in (1, 2):
+        (_, tid, source, target, burst_amount, window_amount, created_ms) = res[:7]
+        content = {
+            "transfer_id": tid,
+            "state": "completed",
+            "source_key_id": source,
+            "target_key_id": target,
+            "burst_amount": int(burst_amount),
+            "window_amount": int(window_amount),
+            "created_at_ms": int(created_ms),
+            "already_transferred": code == 2,
+        }
+        if code == 1:
+            # 首次划转的脚本结果带两边划转后可再占；幂等重放不重算，避免把
+            # 重放时刻的新调用误报成那笔划转刚发生后的余量。
+            content["source_remaining"] = {
+                "burst": int(res[7]),
+                "window": int(res[8]),
+            }
+            content["target_remaining"] = {
+                "burst": int(res[9]),
+                "window": int(res[10]),
+            }
+        return JSONResponse(status_code=200 if code == 2 else 201, content=content)
+
+    reason = res[1]
+    not_found = {
+        "source_not_found": (404, "source key not found"),
+        "target_not_found": (404, "target key not found"),
+    }
+    if reason in not_found:
+        status, message = not_found[reason]
+        raise HTTPException(status_code=status, detail=message)
+    if reason in ("source_revoked", "target_revoked"):
+        raise HTTPException(status_code=409, detail={
+            "code": reason,
+            "message": "both source and target keys must be active",
+        })
+    if reason == "same_key":
+        raise HTTPException(status_code=409, detail={
+            "code": "same_key",
+            "message": "source and target key must be different",
+        })
+    if reason == "bad_amount":
+        raise HTTPException(status_code=422, detail={
+            "code": "bad_amount",
+            "message": "burst_amount/window_amount must be non-negative integers, "
+                       "and at least one must be positive",
+        })
+    if reason == "transfer_id_conflict":
+        raise HTTPException(status_code=409, detail={
+            "code": "transfer_id_conflict",
+            "message": "this transfer_id was already used with different source, "
+                       "target, or amounts",
+            "existing": {
+                "source_key_id": res[2],
+                "target_key_id": res[3],
+                "burst_amount": int(res[4]),
+                "window_amount": int(res[5]),
+            },
+        })
+    if reason in ("insufficient_burst", "insufficient_window"):
+        dimension = "burst" if reason == "insufficient_burst" else "window"
+        # Lua：{0, reason, side, requested, source_available, target_room, held}
+        raise HTTPException(status_code=422, detail={
+            "code": reason,
+            "message": "transferable amount is only the free, unheld quota, and "
+                       "cannot exceed the target key's empty quota room",
+            "dimension": dimension,
+            "limiting_side": res[2],
+            "requested_amount": int(res[3]),
+            "source_available": int(res[4]),
+            "target_room": int(res[5]),
+            "held": int(res[6]),
+        })
+    raise HTTPException(status_code=400, detail=str(reason))
+
+
+@app.get("/v1/transfers", dependencies=[Depends(require_admin)])
+def list_transfers(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
+) -> dict:
+    """列出全部额度划转单，按划转完成时间排序。"""
+    try:
+        ids = _list_transfer_ids(None, limit, offset, order)
+        total = r.zcard(keys.transfers_index_key())
+        items = [view for view in (_transfer_view(tid) for tid in ids) if view]
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    return {"items": items, "limit": limit, "offset": offset, "total": total}
+
+
+@app.get("/v1/transfers/{transfer_id}", dependencies=[Depends(require_admin)])
+def get_transfer(transfer_id: str) -> dict:
+    """查一笔划转：从哪把到哪把、突发/窗口各划多少、何时完成。"""
+    try:
+        view = _transfer_view(transfer_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="transfer not found")
+        return view
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+
+
+@app.get("/v1/keys/{kid}/transfers", dependencies=[Depends(require_admin)])
+def list_key_transfers(
+    kid: str,
+    direction: Optional[str] = Query(default=None, pattern="^(out|in)$",
+                                     description="out=划出，in=划入；缺省两边都列"),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
+) -> dict:
+    """查一把密钥划出/划入过哪些划转单，并给出双向累计。"""
+    cfg = _load_config(kid)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="key not found")
+    try:
+        totals = r.hgetall(keys.transfer_totals_key(kid))
+        if direction == "out":
+            index = keys.transfers_out_index_key(kid)
+            ids = _list_transfer_ids(index, limit, offset, order)
+        elif direction == "in":
+            index = keys.transfers_in_index_key(kid)
+            ids = _list_transfer_ids(index, limit, offset, order)
+        else:
+            out_ids = _list_transfer_ids(keys.transfers_out_index_key(kid),
+                                         limit + offset, 0, order)
+            in_ids = _list_transfer_ids(keys.transfers_in_index_key(kid),
+                                        limit + offset, 0, order)
+            ids = list(dict.fromkeys(out_ids + in_ids))
+            ids.sort(key=lambda tid: r.zscore(keys.transfers_index_key(), tid) or 0,
+                     reverse=(order == "desc"))
+            ids = ids[offset:offset + limit]
+        items = [view for view in (_transfer_view(tid) for tid in ids) if view]
+    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+            redis.exceptions.BusyLoadingError) as exc:
+        raise QuotaStoreUnavailable() from exc
+    return {
+        "key_id": kid,
+        "totals": {
+            "out_burst": int(totals.get("out_burst", "0")),
+            "out_window": int(totals.get("out_window", "0")),
+            "in_burst": int(totals.get("in_burst", "0")),
+            "in_window": int(totals.get("in_window", "0")),
+        },
+        "direction": direction or "all",
+        "items": items,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 def _load_pool(pid: str) -> Optional[dict]:

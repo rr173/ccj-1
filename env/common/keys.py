@@ -66,6 +66,16 @@ def tb_key(kid: str) -> str:
     return f"{{qk:{kid}}}tb"
 
 
+def holds_key(kid: str) -> str:
+    """公共池突发占用登记 ZSET。"""
+    return f"{{qk:{kid}}}holds"
+
+
+def window_holds_key(kid: str) -> str:
+    """公共池窗口占用登记 ZSET。"""
+    return f"{{qk:{kid}}}wholds"
+
+
 def reservation_key(kid: str, idempotency_key: str = "") -> str:
     """占用单 key：一笔占用（先占额度、回音后了结）的凭据。
 
@@ -215,4 +225,32 @@ def cred_used_key(kid: str, cred: str) -> str:
     """某一版明文在这把密钥上“真用掉（已确认、冲正后净额）”的计数。
     挂在逻辑 kid 的 hash tag 下，settle/reverse 与计数变更同一原子动作维护。"""
     return f"{{qk:{kid}}}rcu:{cred}"
+
+
+# ── 跨密钥额度划转 ────────────────────────────────────────────────────────
+# 划转单是管理事实，使用独立 {qt:<id>} tag；脚本同时访问两把密钥的计数键，
+# 与共享池/主备跨钥脚本一样适用于单机/主从 Redis，Cluster 需额外同 slot 设计。
+def transfer_record_key(transfer_id: str) -> str:
+    """一笔额度划转的全局幂等单：hash，源/目标/数量/完成时间都只写一次。"""
+    return f"{{qt:{transfer_id}}}tr"
+
+
+def transfers_index_key() -> str:
+    """全部划转单时间索引：ZSET，member=transfer_id，score=完成毫秒时间。"""
+    return "{qt:0}transfers"
+
+
+def transfers_out_index_key(kid: str) -> str:
+    """某把密钥作为【划出方】的划转索引。"""
+    return f"{{qk:{kid}}}trout"
+
+
+def transfers_in_index_key(kid: str) -> str:
+    """某把密钥作为【划入方】的划转索引。"""
+    return f"{{qk:{kid}}}trin"
+
+
+def transfer_totals_key(kid: str) -> str:
+    """某把密钥累计划出/划入：hash(in_burst/out_burst/in_window/out_window)。"""
+    return f"{{qk:{kid}}}trsum"
 

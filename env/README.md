@@ -34,6 +34,7 @@
 | 冲正已真用掉的一笔 | `POST /v1/keys/{kid}/reversals`，`reverse.lua` 原子完成：只能冲**有效密钥**上、**已调成**的那一笔（写明业务号 + 数量）；一笔业务号只能冲一次（重复提交幂等回原结论），冲的数量不能超过那笔当时真用掉的；冲回的量立刻退回原池令牌桶/原窗口桶，**立刻能再占**；冲正自己在只追加流水上留一笔 `reversal`，之后不能改。密钥停用后拒绝新冲正，已冲过的流水/对账单仍可翻 |
 | 多把有效密钥共用一个跨密钥额度池 | `POST /v1/pools` 开池并写明突发/窗口上限；`PUT/DELETE /v1/pools/{pid}/keys/{kid}` 放入/拿出密钥。数据面每次占用必须同时占住“密钥自己的额度”和“池聚合额度”；任一边占不住即拒绝并给 Retry-After。`GET /v1/pools/{pid}` 查池剩余/在池密钥/还占着/真用掉，密钥余量接口也带 `quota_pool` |
 | 密钥换新（换调用明文，不换配额身份） | `POST /v1/keys/{kid}/rotate` 给**还有效**的密钥换新明文，并写明旧明文宽限多久（`grace_seconds`）。宽限期内新旧两把都能占，吃的是这把密钥**同一份**突发/窗口（真用掉不清零、桶不重填）；宽限过点或 `POST /v1/keys/{kid}/rotate/retire` 提前收掉后旧明文不能再占**新的**；用旧明文开了头还没结的在飞单照样结完。`GET /v1/keys/{kid}/quota` 的 `rotation` 节列出此刻哪些明文还能用、旧的还剩多久、新旧各自真用掉多少。同一业务号跨新旧明文命中同一占用单，不二次占；上一档宽限没到不能再换 |
+| 两把有效密钥间划转当前可再占额度 | `POST /v1/keys/{kid}/transfers` 写明目标密钥、划转号、突发/窗口各划多少；`transfer.lua` 原子保证两边同时做成。只能划源密钥此刻“未真用、未在占”的余量，不能超过目标密钥原配额下的空位；任一头停用、源不足、目标空位不足都整笔拒绝。旧占用单不碰，仍按原池结完。同一划转号原参数重放回原结论、不二次划转，参数不同返回冲突；`GET /v1/keys/{kid}/transfers` 查划出/划入累计和每笔明细，`GET /v1/transfers/{id}` 按号查 |
 | Docker 部署 | `docker compose up -d --build`，含 Redis（持久化卷）、控制面、数据面、模拟上游 |
 
 ## 架构
@@ -149,6 +150,7 @@ python3 demo/e2e_demo.py            # 基础项
 python3 demo/e2e_demo.py --restart  # 额外重启 Redis 验证 AOF 持久化
 python3 demo/failover_demo.py       # 主备顶上
 python3 demo/rotation_demo.py       # 密钥换新（新旧明文宽限/收掉/停用/幂等）
+python3 demo/transfer_demo.py       # 跨密钥额度划转（原子/余量/在飞/幂等/查询）
 ```
 
 ## 限流返回示例
@@ -385,7 +387,9 @@ common/               两端共享的协议（构建时各自打进镜像）
   rotate.lua          控制面：密钥换新——写“明文哈希→逻辑kid”别名与宽限状态，
                       不清零/不重填；上一档宽限没到拒绝再换
   rotate_retire.lua   控制面：宽限期没到提前收掉上一版旧明文（在飞单不碰）
-  keys.py             key 规则、hash、配置字段（含 ledger/共享池/换新规则）
+  transfer.lua        控制面：两把有效密钥原子划转当前可再占突发/窗口（幂等、
+                      只划未真用且未在占的余量，不超目标空位，不碰在飞单）
+  keys.py             key 规则、hash、配置字段（含 ledger/共享池/换新/划转规则）
   script_runner.py    NOSCRIPT 自动重载 + 连接/LOADING/READONLY 退避重试
 control_plane/        FastAPI：签发/停用/列表/查余量/设份额/冲正/翻流水/拉对账单
   ledger.py           占用流水查询（按密钥+调用方/业务号/时间段）与对账单聚合
@@ -526,3 +530,60 @@ curl -s -X POST localhost:8000/v1/pools/<pid>/stop -H "Authorization: Bearer $AD
 > 当前实现的跨密钥 Lua 会访问 `{qk:<kid>}` 与 `{qp:<pid>}` 两类 hash tag，适用
 > 于 docker-compose 使用的单机 Redis；Redis Cluster 要求单脚本同 slot，需要改成
 > 外部两阶段协调或将池归属/计数重新设计为同 slot 键。
+
+## 跨密钥额度划转（只划此刻还能再占的那一截）
+
+两把**都还有效**的逻辑密钥之间，可以把源密钥此刻没有真用掉、也没有占着的
+突发/窗口额度划给目标密钥。划转是管理面动作，由一段跨密钥 Lua 原子完成，
+不会出现源扣了、目标没到的半笔。
+
+```bash
+curl -s -X POST localhost:8000/v1/keys/<source_kid>/transfers \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"transfer_id":"tr-20260911-001","target_key_id":"<target_kid>",
+       "burst_amount":2,"window_amount":10}'
+# 目标需要先有对应空位（例如已经真用掉一部分且未占满）。成功 ->
+# 201 {"transfer_id":"tr-...","source_key_id":"...","target_key_id":"...",
+#         "burst_amount":2,"window_amount":10,
+#         "source_remaining":{"burst":...,"window":...},
+#         "target_remaining":{"burst":...,"window":...}}
+```
+
+查询：
+
+```bash
+# 一把密钥划出/划入累计 + 明细（direction=out|in，缺省两边都列）
+curl -s "localhost:8000/v1/keys/<kid>/transfers?direction=out" -H "Authorization: Bearer $ADMIN"
+# 按划转号查单笔：从哪把到哪把、突发/窗口各多少、何时完成
+curl -s localhost:8000/v1/transfers/tr-20260911-001 -H "Authorization: Bearer $ADMIN"
+# 全部划转单
+curl -s localhost:8000/v1/transfers -H "Authorization: Bearer $ADMIN"
+```
+
+硬规则：
+
+- **划转号幂等**：`transfer_id` 必填。同一号、同一源/目标/数量再来，返回 200
+  与第一次的划转单（`already_transferred=true`），不二次划转；同号但参数不同
+  返回 409 `transfer_id_conflict`，不能借同一个号改账。
+- **只能在有效密钥间划**：源或目标不存在返回 404；任一方已停用返回 409。
+- **不划已真用掉、不划还占着的**：可划突发按令牌桶当前令牌扣掉未到期占用计算；
+  可划窗口按滑动窗口已用扣掉未到期占用计算。源不足返回 422
+  `insufficient_burst/window`，响应同时给出 `source_available`、`target_room`
+  与 `held`。
+- **不能超过目标自己还装得下的空位**：目标的空位 = 原配额下现在已经真用掉
+  与在飞占住导致“装不下新请求”的容量；满额未用、或已有冲正/划入溢余不会产生
+  空位。目标空位不足时整笔拒绝。
+- **两边同时做成**：突发维度在源/目标令牌桶原子增减，窗口维度在两边当前固定
+  桶原子记正/负用量，随后 `GET /quota` 与数据面下一次 reserve 立刻按新余量。
+- **在飞单不受影响**：划转不读、不改、不释放任何 `res:*` 或 holds 成员。已经
+  占着的单子仍按原占用单记录的池、容量与计数路径确认/退回；新占用才按划转后
+  的余量判定。
+- **窗口划转随窗口自然老化**：这笔“源已用、目标可用”的调整落在划转时刻的
+  滑动窗口固定桶，到窗口滑出后自然结束；它不是永久修改两边的 `window_quota`
+  配置。突发划转则是此刻令牌的立即转移，之后仍按各密钥自己的补充速率补充。
+- **份额池按各自空位参与，不被跨钥混用**：公共池与每个点名份额池独立计算
+  当前余量和目标空位；脚本按“公共池优先、份额按调用方名排序”从各池扣出/填回，
+  一次划转可由多个池凑齐。目标旧在飞单不释放，填入其空位的新余量在旧单确认后
+  成为可再占额度。
+- **与共享池相互独立**：划转改变的是成员密钥自己的余量；跨密钥共享池仍是额外
+  一道聚合闸门，不会因为密钥侧划转而平白增加池额度。
